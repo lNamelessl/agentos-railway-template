@@ -52,7 +52,11 @@ jobs:
           # Re-apply the template ws-repair fix (standalone tracing drops
           # lazily-required files; see patch header for details).
           patch -p1 --forward < .github/template/dockerfile-template.patch
+          # Re-apply the template liveness probe (deterministic deploy
+          # gating; see patch header for details).
+          patch -p1 --forward < .github/template/proxy-healthz.patch
           cp .github/template/README.md README.md
+          cp .github/template/TEMPLATE_OVERVIEW.md TEMPLATE_OVERVIEW.md
           cp .github/template/railway.json railway.json
           sed -i "s/^commit: .*/commit: ${{ steps.upstream.outputs.sha }}/" UPSTREAM_PIN
           today="$(date -u +%F)"

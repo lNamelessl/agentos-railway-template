@@ -13,7 +13,7 @@ workspaces, tasks, model providers, approvals, and runtime visibility from one c
 ## What one-click deploy creates
 
 - **One public `AgentOS` service** built from `Dockerfile`:
-  - Next.js control plane (AgentOS 0.8.0) + pinned OpenClaw Gateway runtime (2026.9.3),
+  - Next.js control plane (AgentOS 0.8.0) + pinned OpenClaw Gateway runtime (2026.9.4),
     co-located and supervised in a single container.
   - The supervisor starts the OpenClaw Gateway (container-loopback only), a secure local
     browser worker (container-loopback only), the Next.js app, and a same-origin public
@@ -27,8 +27,12 @@ workspaces, tasks, model providers, approvals, and runtime visibility from one c
     sign in, then delete the password variable.
   - `OPENCLAW_GATEWAY_TOKEN` and `AGENTOS_API_TOKEN` (generated) — internal service
     authentication.
-- **Healthcheck** on `/api/health` (the lightest route; reveals no version/token/account
-  detail).
+- **Healthcheck** on `/_agentos/healthz` — a template-owned liveness probe served
+  directly by the same-origin public proxy: 200 requires the OpenClaw Gateway's
+  loopback `/healthz` AND a live control-plane listener, and it reveals no
+  version/token/account detail. Deterministic across redeploys (it does not
+  depend on the app-to-gateway channel connect timing). The app's deep health
+  endpoint `/api/health` remains available to operators.
 
 ## Security model
 

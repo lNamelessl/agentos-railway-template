@@ -3,9 +3,14 @@ commit: 5a39898edb11da8036d6808ceb09f910aca770b1
 commit-date: 2026-09-16T21:38:34+03:00
 pinned: 2026-09-17
 agentos-package: 0.8.0 (@sapienx/agentos)
-openclaw: 2026.9.3 (digest-pinned in Dockerfile: sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b)
+openclaw: 2026.9.4 (digest-pinned in Dockerfile: sha256:cc596b846506a5f4cfcee111394a2725f375f01cca2ebb492a161fd1b747f101)
 node-base: node:24.20.0-bookworm (digest-pinned in Dockerfile: sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2)
 license: MIT (upstream)
-template-fixes: Dockerfile carries a ws-repair step (.github/template/dockerfile-template.patch):
-  Next.js standalone tracing drops lazily-required files (ws/lib/stream.js), which breaks
-  @openclaw/gateway-client at runtime ("Cannot find module './lib/stream'") and 500s /api/health.
+template-fixes: applied by .github/workflows/weekly-upstream-bump.yml after each re-vendor —
+  1. .github/template/dockerfile-template.patch: Next.js standalone tracing drops
+     lazily-required files (ws/lib/stream.js), which breaks @openclaw/gateway-client at
+     runtime ("Cannot find module './lib/stream'") and 500s /api/health.
+  2. .github/template/proxy-healthz.patch: adds the /_agentos/healthz liveness probe to
+     scripts/railway-public-proxy.mjs (gateway /healthz + control-plane listener) so the
+     Railway healthcheck is deterministic and does not flake on the app-to-gateway
+     channel connect timing; railway.json points healthcheckPath at it.

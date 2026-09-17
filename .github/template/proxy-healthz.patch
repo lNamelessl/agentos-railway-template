@@ -1,0 +1,89 @@
+diff --git a/scripts/railway-public-proxy.mjs b/scripts/railway-public-proxy.mjs
+index 45d985c..ea4dcf6 100644
+--- a/scripts/railway-public-proxy.mjs
++++ b/scripts/railway-public-proxy.mjs
+@@ -8,6 +8,9 @@ const liveViewPathPattern =
+ const browserLiveExchangePath = "/api/accounts/browser-live/exchange";
+ const maximumBrowserLiveExchangeBytes = 16 * 1024;
+ const cdpRelayPrefix = "/_agentos/browser-cdp";
++const gatewayHealthPath = "/_agentos/healthz";
++const gatewayHealthUrl =
++  process.env.AGENTOS_GATEWAY_HEALTH_URL || "http://127.0.0.1:18789/healthz";
+ const maximumCdpResponseBytes = 4 * 1024 * 1024;
+ const browserLiveCsp = [
+   "default-src 'self'",
+@@ -39,6 +42,10 @@ export async function startRailwayPublicProxy(input) {
+   });
+ 
+   const server = createServer((request, response) => {
++    if (isGatewayHealthRequest(request.url)) {
++      void handleGatewayHealth({ request, response, nextPort });
++      return;
++    }
+     if (isCdpRelayRequest(request.url)) {
+       void proxyPrivateCdpRequest({
+         request,
+@@ -101,6 +108,63 @@ export async function startRailwayPublicProxy(input) {
+   return server;
+ }
+ 
++// Template deploy liveness probe: a deterministic answer straight from the
++// proxy. 200 requires the OpenClaw Gateway loopback /healthz AND a live
++// control-plane listener; it never touches auth, the session database, or
++// upstream app logic, so deploy gating cannot flake on the app-to-gateway
++// channel connect timing. The app's own deep health endpoint (/api/health)
++// stays available to operators and reports channel-level readiness detail.
++function isGatewayHealthRequest(value) {
++  const pathname = (value || "").split("?")[0];
++  return pathname === gatewayHealthPath;
++}
++
++async function handleGatewayHealth(input) {
++  if (input.request.method !== "GET" && input.request.method !== "HEAD") {
++    input.response.writeHead(405, {
++      "Cache-Control": "no-store",
++      "Content-Type": "application/json; charset=utf-8"
++    });
++    input.response.end(JSON.stringify({ status: "error" }));
++    return;
++  }
++  const [gatewayAlive, controlPlaneAlive] = await Promise.all([
++    probeGatewayHealth(gatewayHealthUrl),
++    probeControlPlaneAlive(input.nextPort)
++  ]);
++  const alive = gatewayAlive && controlPlaneAlive;
++  input.response.writeHead(alive ? 200 : 503, {
++    "Cache-Control": "no-store",
++    "Content-Type": "application/json; charset=utf-8"
++  });
++  input.response.end(JSON.stringify({ status: alive ? "ok" : "starting" }));
++}
++
++async function probeGatewayHealth(url) {
++  try {
++    const response = await fetch(url, {
++      cache: "no-store",
++      signal: AbortSignal.timeout(1_500)
++    });
++    return response.ok;
++  } catch {
++    return false;
++  }
++}
++
++async function probeControlPlaneAlive(port) {
++  try {
++    const response = await fetch(`http://127.0.0.1:${port}/`, {
++      redirect: "manual",
++      cache: "no-store",
++      signal: AbortSignal.timeout(1_500)
++    });
++    return response.status > 0;
++  } catch {
++    return false;
++  }
++}
++
+ function proxyHttpRequest(input) {
+   const headers = stripHopByHopHeaders(input.request.headers);
+   const upstream = httpRequest({
