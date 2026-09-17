@@ -55,9 +55,9 @@ jobs:
           today="$(date -u +%F)"
           sed -i "s/^pinned: .*/pinned: ${today}/" UPSTREAM_PIN
 
-      - name: Smoke test — docker build (Dockerfile.railway)
+      - name: Smoke test — docker build (Dockerfile)
         if: steps.upstream.outputs.changed == 'true'
-        run: docker build -f Dockerfile.railway -t agentos-railway:bump-smoke .
+        run: docker build -f Dockerfile -t agentos-railway:bump-smoke .
 
       - name: Create bump pull request
         if: steps.upstream.outputs.changed == 'true'
