@@ -12,7 +12,7 @@ workspaces, tasks, model providers, approvals, and runtime visibility from one c
 
 ## What one-click deploy creates
 
-- **One public `AgentOS` service** built from `Dockerfile.railway`:
+- **One public `AgentOS` service** built from `Dockerfile`:
   - Next.js control plane (AgentOS 0.8.0) + pinned OpenClaw Gateway runtime (2026.9.3),
     co-located and supervised in a single container.
   - The supervisor starts the OpenClaw Gateway (container-loopback only), a secure local
@@ -70,12 +70,12 @@ service. See upstream `docs/deploy-on-railway.md`.
 
 - Template deploys build from this pinned snapshot: reproducible and immune to upstream
   churn (upstream pins its own base images and OpenClaw version inside
-  `Dockerfile.railway`).
+  `Dockerfile`).
 - A weekly GitHub Action checks upstream, and on a new commit replaces the vendored tree,
-  runs a `Dockerfile.railway` build smoke test, and opens a bump PR **only if the smoke
+  runs a `Dockerfile` build smoke test, and opens a bump PR **only if the smoke
   test passes**.
 - To bump manually: update the vendored tree and `UPSTREAM_PIN`, then verify
-  `docker build -f Dockerfile.railway .`
+  `docker build -f Dockerfile .`
 
 ## License
 

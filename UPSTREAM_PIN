@@ -3,6 +3,6 @@ commit: 5a39898edb11da8036d6808ceb09f910aca770b1
 commit-date: 2026-09-16T21:38:34+03:00
 pinned: 2026-09-17
 agentos-package: 0.8.0 (@sapienx/agentos)
-openclaw: 2026.9.3 (digest-pinned in Dockerfile.railway: sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b)
-node-base: node:24.20.0-bookworm (digest-pinned in Dockerfile.railway: sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2)
+openclaw: 2026.9.3 (digest-pinned in Dockerfile: sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b)
+node-base: node:24.20.0-bookworm (digest-pinned in Dockerfile: sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2)
 license: MIT (upstream)
