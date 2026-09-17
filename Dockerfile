@@ -39,6 +39,8 @@ RUN apt-get update && \
 
 WORKDIR /agentos
 
+EXPOSE 3000
+
 COPY --from=agentos-build --chown=node:node /build/.next/standalone ./
 COPY --from=agentos-build --chown=node:node /build/.next/static ./.next/static
 COPY --from=agentos-build --chown=node:node /build/public ./public

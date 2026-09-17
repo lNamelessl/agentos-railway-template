@@ -3,6 +3,9 @@ set -eu
 
 umask 077
 
+# TEMP-DIAG: wipe persisted state (clean-volume boot hypothesis test)
+rm -rf /data/agentos /data/openclaw /data/openclaw-config /data/workspaces /data/browser-profiles
+
 service_role=$(printf '%s' "${AGENTOS_SERVICE_ROLE:-agentos}" | tr '[:upper:]' '[:lower:]')
 
 if [ "$service_role" = "browser-worker" ]; then
@@ -52,5 +55,19 @@ if [ ! -s /data/agentos/instance-protection.json ] && [ "${AGENTOS_INITIAL_ADMIN
   echo "AGENTOS_INITIAL_ADMIN_PASSWORD is required for the first deployment." >&2
   exit 1
 fi
+
+# TEMP-DIAG: background self-probe logger (20 samples, 20s apart)
+(
+  i=0
+  while [ "$i" -lt 20 ]; do
+    sleep 20
+    ports=$(awk 'NR>1 {print $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | cut -d: -f2 | sort -u | tr '\n' ' ')
+    healthz=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:3000/_agentos/healthz 2>/dev/null || echo ERR)
+    login=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:3000/login 2>/dev/null || echo ERR)
+    gw=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:18789/healthz 2>/dev/null || echo ERR)
+    echo "TEMP-DIAG t=$((i+1)*20)s ports=[$ports] self_healthz=$healthz self_login=$login gw_healthz=$gw"
+    i=$((i+1))
+  done
+) &
 
 exec gosu node:node node /agentos/scripts/railway-supervisor.mjs
