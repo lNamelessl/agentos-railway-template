@@ -1,0 +1,37 @@
+diff --git a/Dockerfile b/Dockerfile
+index b364509..9ca522e 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -10,7 +10,13 @@ WORKDIR /build
+ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+ RUN pnpm install --frozen-lockfile
+ RUN mkdir -p /runtime-extras/node_modules && \
+-    cp -LR node_modules/ws /runtime-extras/node_modules/ws
++    cp -LR node_modules/ws /runtime-extras/node_modules/ws && \
++    mkdir -p /runtime-extras/pnpm-ws && \
++    for d in node_modules/.pnpm/ws@*/; do \
++      name="$(basename "$d")"; \
++      mkdir -p "/runtime-extras/pnpm-ws/$name"; \
++      cp -LR "$d/node_modules/ws" "/runtime-extras/pnpm-ws/$name/ws"; \
++    done
+ 
+ COPY . .
+ RUN pnpm build
+@@ -61,6 +67,17 @@ RUN chmod 0755 ./scripts/railway-entrypoint.sh ./scripts/railway-browser-worker-
+       /home/node/.config/openclaw \
+       /home/node/Documents/Shared/projects
+ 
++# Template fix: Next.js standalone output tracing can drop lazily-required files
++# (observed with ws/lib/stream.js), which breaks @openclaw/gateway-client at runtime
++# with "Cannot find module './lib/stream'". Repair incomplete traced ws copies from
++# the complete versions captured in the build stage's pnpm store.
++COPY --from=agentos-build --chown=node:node /runtime-extras/pnpm-ws /tmp/pnpm-ws
++RUN for src in /tmp/pnpm-ws/ws@*; do \
++      ver="$(basename "$src")"; \
++      dst="./node_modules/.pnpm/$ver/node_modules/ws"; \
++      if [ -d "$dst" ]; then rm -rf "$dst" && cp -LR "$src/ws" "$dst"; fi; \
++    done; rm -rf /tmp/pnpm-ws
++
+ ENV NODE_ENV=production \
+     HOSTNAME=0.0.0.0 \
+     HOME=/home/node \

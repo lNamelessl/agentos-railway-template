@@ -49,6 +49,9 @@ jobs:
           # railway.json; Railway auto-detects only a root-level `Dockerfile`, so we
           # rename and restore our config-as-code on every bump.
           if [ -f Dockerfile.railway ] && [ ! -f Dockerfile ]; then mv Dockerfile.railway Dockerfile; fi
+          # Re-apply the template ws-repair fix (standalone tracing drops
+          # lazily-required files; see patch header for details).
+          patch -p1 --forward < .github/template/dockerfile-template.patch
           cp .github/template/README.md README.md
           cp .github/template/railway.json railway.json
           sed -i "s/^commit: .*/commit: ${{ steps.upstream.outputs.sha }}/" UPSTREAM_PIN
