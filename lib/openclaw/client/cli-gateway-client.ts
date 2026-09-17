@@ -1,0 +1,1320 @@
+import "server-only";
+
+import {
+  runOpenClaw,
+  runOpenClawForRuntime,
+  runOpenClawJson,
+  runOpenClawJsonForRuntime,
+  runOpenClawJsonStream,
+  type CommandResult,
+  type OpenClawCliRuntimeEnvironment
+} from "@/lib/openclaw/cli";
+import { stringifyCommandFailure } from "@/lib/openclaw/command-failure";
+import { containsRedactedOpenClawSecret } from "@/lib/openclaw/client/native-ws-gateway-utils";
+import { OpenClawGatewayClientError } from "@/lib/openclaw/client/native-ws-gateway-errors";
+import { OPENCLAW_GATEWAY_PROTOCOL_RANGE } from "@/lib/openclaw/client/native-ws-gateway-types";
+import { OPENCLAW_SUPPORTED_BASELINE_VERSION } from "@/lib/openclaw/versions";
+import { redactSecretText } from "@/lib/security/redaction";
+import { resolveAuthoritativeRuntimeOwnershipProof } from "@/lib/openclaw/lifecycle/runtime-provenance";
+import {
+  resolveLocalCliRuntimeIdentity,
+  resolveMemoryCliFallbackLocality,
+  type MemoryCliFallbackLocality
+} from "@/lib/openclaw/client/memory-cli-locality";
+import type {
+  AgentPayload,
+  GatewayProbePayload,
+  GatewayStatusPayload,
+  MissionCommandPayload,
+  ModelsPayload,
+  ModelsStatusPayload,
+  OpenClawAddAgentInput,
+  OpenClawAgentIdentityInput,
+  OpenClawAgentModelStatusInput,
+  OpenClawArtifactDeleteInput,
+  OpenClawArtifactDownloadInput,
+  OpenClawArtifactDownloadPayload,
+  OpenClawArtifactGetInput,
+  OpenClawArtifactListInput,
+  OpenClawArtifactListPayload,
+  OpenClawArtifactPayload,
+  OpenClawArtifactPutInput,
+  OpenClawAutomationProvisionInput,
+  OpenClawChannelAccountProvisionInput,
+  OpenClawChannelAccountRemoveInput,
+  OpenClawChannelStatusInput,
+  OpenClawChannelStatusPayload,
+  OpenClawChannelLogoutInput,
+  OpenClawWebLoginResult,
+  OpenClawWebLoginStartInput,
+  OpenClawWebLoginWaitInput,
+  OpenClawChannelLogsInput,
+  OpenClawChannelLogsPayload,
+  OpenClawAgentListPayload,
+  OpenClawAgentTurnInput,
+  OpenClawChatInjectInput,
+  OpenClawCommandOptions,
+  OpenClawConfigSchemaLookupInput,
+  OpenClawConfigSchemaLookupPayload,
+  OpenClawCronListInput,
+  OpenClawCronListPayload,
+  OpenClawCronGetInput,
+  OpenClawCronRunInput,
+  OpenClawCronRunPayload,
+  OpenClawCronRunsInput,
+  OpenClawCronRunsPayload,
+  OpenClawCronStatusPayload,
+  OpenClawDescribeSessionInput,
+  OpenClawDeviceApproveInput,
+  OpenClawDeviceApprovePayload,
+  OpenClawDeviceListPayload,
+  OpenClawExecApprovalListInput,
+  OpenClawExecApprovalListPayload,
+  OpenClawExecApprovalResolveInput,
+  OpenClawExecApprovalResolvePayload,
+  OpenClawGatewayClient,
+  OpenClawGatewayClientDiagnostics,
+  OpenClawGatewayEventCallbacks,
+  OpenClawGatewayEventSubscription,
+  OpenClawGatewaySurfaceInput,
+  OpenClawGatewaySurfacePayload,
+  OpenClawGmailSetupInput,
+  OpenClawHealthPayload,
+  OpenClawListModelsInput,
+  OpenClawListSessionsInput,
+  OpenClawLogsTailInput,
+  OpenClawLogsTailPayload,
+  OpenClawMemoryAgentInput,
+  OpenClawMemoryIndexRebuildPayload,
+  OpenClawMemoryIndexStatusPayload,
+  OpenClawRuntimeIdentity,
+  OpenClawRuntimeOwnershipProof,
+  OpenClawModelScanPayload,
+  OpenClawModelAuthOrderSetInput,
+  OpenClawPluginListPayload,
+  OpenClawRuntimeEventSubscriptionInput,
+  OpenClawRuntimeSnapshotInput,
+  OpenClawRuntimeSnapshotPayload,
+  OpenClawSessionExportInput,
+  OpenClawSessionExportPayload,
+  OpenClawSessionHistoryInput,
+  OpenClawSessionHistoryPayload,
+  OpenClawSessionControlPayload,
+  OpenClawSessionModelPatchPayload,
+  OpenClawSessionPayload,
+  OpenClawSessionSteerInput,
+  OpenClawSessionsPayload,
+  OpenClawSkillListPayload,
+  OpenClawStreamCallbacks,
+  OpenClawTaskAssignInput,
+  OpenClawTaskCancelInput,
+  OpenClawTaskGetInput,
+  OpenClawTaskListInput,
+  OpenClawTaskListPayload,
+  OpenClawTaskPayload,
+  OpenClawToolInvokeInput,
+  OpenClawToolInvokePayload,
+  OpenClawToolsCatalogInput,
+  OpenClawToolsCatalogPayload,
+  OpenClawToolsEffectiveInput,
+  OpenClawToolsEffectivePayload,
+  OpenClawUpdateStatusPayload,
+  StatusPayload
+} from "@/lib/openclaw/client/types";
+import type { OpenClawOperatorIdentity } from "@/lib/openclaw/identity/types";
+
+function buildAgentTurnArgs(input: OpenClawAgentTurnInput) {
+  const args = [
+    "agent",
+    "--agent",
+    input.agentId,
+  ];
+
+  if (input.sessionId) {
+    args.push("--session-id", input.sessionId);
+  }
+
+  if (input.local) {
+    args.push("--local");
+  }
+
+  args.push(
+    "--message",
+    input.message,
+    "--thinking",
+    input.thinking ?? "medium",
+    "--timeout",
+    String(input.timeoutSeconds ?? 45),
+    "--json"
+  );
+
+  return args;
+}
+
+function buildAgentSessionKey(agentId?: string | null, sessionId?: string | null) {
+  const trimmedSessionId = sessionId?.trim();
+  const trimmedAgentId = agentId?.trim() || "main";
+  return trimmedSessionId
+    ? `agent:${trimmedAgentId}:explicit:${trimmedSessionId}`
+    : `agent:${trimmedAgentId}:main`;
+}
+
+function buildSessionReferenceParams(input: { key?: string | null; sessionKey?: string | null; sessionId?: string | null; agentId?: string | null } = {}) {
+  const key = input.key?.trim() || input.sessionKey?.trim();
+  if (key) {
+    return { key };
+  }
+
+  const sessionId = input.sessionId?.trim();
+  const agentId = input.agentId?.trim();
+  return {
+    agentId: agentId || undefined,
+    sessionId: sessionId || undefined,
+    key: agentId || sessionId ? buildAgentSessionKey(agentId, sessionId) : undefined
+  };
+}
+
+function buildSessionHistoryParams(input: OpenClawSessionHistoryInput = {}) {
+  return {
+    ...buildSessionReferenceParams(input),
+    limit: input.limit,
+    cursor: input.cursor ?? undefined
+  };
+}
+
+function buildChatHistoryParams(input: OpenClawSessionHistoryInput = {}) {
+  const reference = buildSessionReferenceParams(input);
+  return {
+    sessionKey: reference.key,
+    limit: input.limit,
+    cursor: input.cursor ?? undefined
+  };
+}
+
+function buildSessionPreviewParams(input: OpenClawSessionHistoryInput = {}) {
+  const reference = buildSessionReferenceParams(input);
+  const key = reference.key;
+  return {
+    key,
+    sessionKey: key,
+    sessionKeys: key ? [key] : undefined,
+    limit: input.limit,
+    cursor: input.cursor ?? undefined
+  };
+}
+
+function buildArtifactListParams(input: OpenClawArtifactListInput = {}) {
+  const taskId = input.taskId?.trim();
+  const runId = input.runId?.trim();
+  const sessionKey = input.sessionKey?.trim() || input.sessionId?.trim();
+
+  return {
+    taskId: taskId || undefined,
+    runId: runId || undefined,
+    sessionKey: sessionKey || undefined
+  };
+}
+
+function hasArtifactListScope(input: OpenClawArtifactListInput | OpenClawRuntimeSnapshotInput = {}) {
+  return Boolean(input.taskId?.trim() || input.runId?.trim() || input.sessionKey?.trim() || input.sessionId?.trim());
+}
+
+function buildRuntimeSnapshotArtifactListInput(input: OpenClawRuntimeSnapshotInput): OpenClawArtifactListInput {
+  return {
+    taskId: input.taskId,
+    runId: input.runId,
+    sessionKey: input.sessionKey,
+    sessionId: input.sessionId
+  };
+}
+
+function buildSessionExportPayload(
+  input: OpenClawSessionExportInput,
+  payload: Record<string, unknown>
+): OpenClawSessionExportPayload {
+  if (typeof payload.content === "string") {
+    return {
+      ...payload,
+      format: input.format ?? (typeof payload.format === "string" ? payload.format : "json")
+    };
+  }
+
+  const format = input.format ?? "json";
+  return {
+    ...payload,
+    format,
+    session: payload.session ?? payload,
+    content: format === "json" ? JSON.stringify(payload) : undefined
+  };
+}
+
+function summarizeSnapshotError(reason: unknown) {
+  return reason instanceof Error ? reason.message : String(reason || "Unknown OpenClaw Gateway snapshot error.");
+}
+
+function buildGmailSetupArgs(input: OpenClawGmailSetupInput) {
+  const config = input.config ?? {};
+  const args = ["webhooks", "gmail", "setup", "--account", input.account];
+  const serveConfig = isObjectRecord(config.serve) ? config.serve : {};
+  const tailscaleConfig = isObjectRecord(config.tailscale) ? config.tailscale : {};
+
+  appendOptionalCliFlag(args, "--project", config.project);
+  appendOptionalCliFlag(args, "--topic", config.topic);
+  appendOptionalCliFlag(args, "--subscription", config.subscription);
+  appendOptionalCliFlag(args, "--label", config.label);
+  appendOptionalCliFlag(args, "--hook-url", config.hookUrl);
+  appendOptionalCliFlag(args, "--hook-token", config.hookToken);
+  appendOptionalCliFlag(args, "--push-token", config.pushToken);
+  appendOptionalCliFlag(args, "--bind", serveConfig.bind);
+  appendOptionalCliFlag(args, "--port", serveConfig.port);
+  appendOptionalCliFlag(args, "--path", serveConfig.path);
+  appendBooleanCliFlag(args, "--include-body", config.includeBody);
+  appendOptionalCliFlag(args, "--max-bytes", config.maxBytes);
+  appendOptionalCliFlag(args, "--renew-minutes", config.renewEveryMinutes);
+  appendOptionalCliFlag(args, "--tailscale", tailscaleConfig.mode);
+  appendOptionalCliFlag(args, "--tailscale-path", tailscaleConfig.path);
+  appendOptionalCliFlag(args, "--tailscale-target", tailscaleConfig.target);
+  appendOptionalCliFlag(args, "--push-endpoint", config.pushEndpoint);
+
+  return args;
+}
+
+function buildAgentIdentityArgs(input: OpenClawAgentIdentityInput) {
+  const args = [
+    "agents",
+    "set-identity",
+    "--agent",
+    input.agentId,
+    "--workspace",
+    input.workspace,
+    "--identity-file",
+    input.identityFile,
+    "--json"
+  ];
+
+  appendOptionalCliFlag(args, "--name", input.name);
+  appendOptionalCliFlag(args, "--emoji", input.emoji);
+  appendOptionalCliFlag(args, "--theme", input.theme);
+  appendOptionalCliFlag(args, "--avatar", input.avatar);
+
+  return args;
+}
+
+function buildAutomationProvisionArgs(input: OpenClawAutomationProvisionInput) {
+  const args = [
+    "cron",
+    "add",
+    "--name",
+    input.name,
+    "--description",
+    input.description || input.name,
+    "--agent",
+    input.agentId,
+    "--message",
+    input.message,
+    "--thinking",
+    input.thinking || "medium",
+    "--timeout-seconds",
+    String(input.timeoutSeconds ?? 120),
+    "--json"
+  ];
+
+  if (input.schedule.kind === "every") {
+    args.push("--every", input.schedule.value);
+  } else {
+    args.push("--cron", input.schedule.value);
+  }
+
+  if (input.announce?.channel) {
+    args.push("--announce", "--channel", input.announce.channel);
+    appendOptionalCliFlag(args, "--to", input.announce.target);
+  }
+
+  return args;
+}
+
+function appendOptionalCliFlag(args: string[], flag: string, value: unknown) {
+  const normalized = normalizeCliFlagValue(value);
+  if (normalized === null) {
+    return;
+  }
+
+  args.push(flag, normalized);
+}
+
+function appendBooleanCliFlag(args: string[], flag: string, value: unknown) {
+  if (value === true || value === "true") {
+    args.push(flag);
+  }
+}
+
+function normalizeCliFlagValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export type CliOpenClawGatewayClientOptions = {
+  runtimeIdentity?: OpenClawRuntimeIdentity | null;
+  resolveMemoryCliFallbackLocality?: () => Promise<MemoryCliFallbackLocality>;
+  runMemoryJson?: <TPayload>(
+    args: string[],
+    runtimeEnvironment: OpenClawCliRuntimeEnvironment,
+    options?: OpenClawCommandOptions
+  ) => Promise<TPayload>;
+  runMemory?: (
+    args: string[],
+    runtimeEnvironment: OpenClawCliRuntimeEnvironment,
+    options?: OpenClawCommandOptions
+  ) => Promise<CommandResult>;
+};
+
+export class OpenClawMemoryCliFallbackUnavailableError extends Error {
+  readonly locality: MemoryCliFallbackLocality;
+  readonly code = "memory-cli-fallback-unavailable" as const;
+
+  constructor(locality: MemoryCliFallbackLocality) {
+    super(locality.reason ?? "OpenClaw memory CLI maintenance is unavailable.");
+    this.name = "OpenClawMemoryCliFallbackUnavailableError";
+    this.locality = locality;
+  }
+}
+
+export class CliOpenClawGatewayClient implements OpenClawGatewayClient {
+  private readonly options: CliOpenClawGatewayClientOptions;
+
+  constructor(options: CliOpenClawGatewayClientOptions = {}) {
+    this.options = {
+      ...options,
+      runMemoryJson: options.runMemoryJson ?? ((args, runtimeEnvironment, commandOptions) =>
+        runOpenClawJsonForRuntime(args, runtimeEnvironment, commandOptions)),
+      runMemory: options.runMemory ?? ((args, runtimeEnvironment, commandOptions) =>
+        runOpenClawForRuntime(args, runtimeEnvironment, commandOptions))
+    };
+  }
+
+  getRuntimeIdentity() {
+    return this.options.runtimeIdentity ?? null;
+  }
+
+  getRuntimeOwnershipProof(): Promise<OpenClawRuntimeOwnershipProof | null> {
+    return this.options.runtimeIdentity
+      ? resolveAuthoritativeRuntimeOwnershipProof(this.options.runtimeIdentity)
+      : Promise.resolve(null);
+  }
+
+  async getOperatorIdentity(): Promise<OpenClawOperatorIdentity> {
+    return {
+      requestedRole: null,
+      role: null,
+      requestedScopes: [],
+      grantedScopes: [],
+      grantedScopesKnown: false,
+      deviceId: null,
+      connectionId: null,
+      authenticated: false,
+      source: "cli-fallback"
+    };
+  }
+
+  getDiagnostics(): OpenClawGatewayClientDiagnostics {
+    return {
+      mode: "cli",
+      transportImplementation: "cli",
+      gatewayMode: "cli-forced",
+      statusLabel: "CLI fallback forced",
+      recovery: "Unset the CLI-forced Gateway mode and restart AgentOS to use the native OpenClaw Gateway.",
+      connectionState: "cli-forced",
+      protocolVersion: null,
+      protocolRange: OPENCLAW_GATEWAY_PROTOCOL_RANGE,
+      fallbackCounts: {},
+      fallbackTotal: 0,
+      recentFallbackDiagnostics: [],
+      lastNativeError: null,
+      lastNativeFailureAt: null,
+      lastConnectedAt: null,
+      lastDisconnectedAt: null,
+      operatorIdentity: {
+        requestedRole: null,
+        role: null,
+        requestedScopes: [],
+        grantedScopes: [],
+        grantedScopesKnown: false,
+        deviceId: null,
+        connectionId: null,
+        authenticated: false,
+        source: "cli-fallback"
+      }
+    };
+  }
+
+  getHealth(options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawHealthPayload>("health", {}, options);
+  }
+
+  getStatus(options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<StatusPayload>(["status", "--json"], options);
+  }
+
+  async getMemoryIndexStatus(
+    input: OpenClawMemoryAgentInput,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawMemoryIndexStatusPayload> {
+    const agentId = requireMemoryAgentId(input);
+    const locality = await this.resolveMemoryCliFallbackLocality();
+    if (locality.status !== "proven-same-runtime" || !locality.cliEnvironment) {
+      return createUnavailableMemoryIndexStatus(agentId, locality);
+    }
+
+    const raw = await this.options.runMemoryJson!<unknown>(
+      ["memory", "status", "--json", "--agent", agentId],
+      locality.cliEnvironment,
+      { ...options, timeoutMs: options.timeoutMs ?? 20_000 }
+    );
+    return {
+      ...normalizeMemoryIndexStatus(raw, agentId),
+      availability: "available",
+      locality: "available-local-same-runtime",
+      localityReason: null
+    };
+  }
+
+  async rebuildMemoryIndex(
+    input: OpenClawMemoryAgentInput,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawMemoryIndexRebuildPayload> {
+    const agentId = requireMemoryAgentId(input);
+    const locality = await this.resolveMemoryCliFallbackLocality();
+    if (locality.status !== "proven-same-runtime" || !locality.cliEnvironment) {
+      throw new OpenClawMemoryCliFallbackUnavailableError(locality);
+    }
+
+    await this.options.runMemory!(
+      ["memory", "index", "--force", "--agent", agentId],
+      locality.cliEnvironment,
+      { ...options, timeoutMs: options.timeoutMs ?? 4 * 60_000 }
+    );
+    return {
+      agentId,
+      appliedVia: "cli-fallback",
+      command: "memory index --force"
+    };
+  }
+
+  private async resolveMemoryCliFallbackLocality() {
+    if (this.options.resolveMemoryCliFallbackLocality) {
+      return this.options.resolveMemoryCliFallbackLocality();
+    }
+
+    return resolveMemoryCliFallbackLocality({
+      gatewayRuntime: this.options.runtimeIdentity,
+      cliRuntime: resolveLocalCliRuntimeIdentity()
+    });
+  }
+
+  getUpdateStatus(options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<OpenClawUpdateStatusPayload>(["update", "status", "--json"], options);
+  }
+
+  getGatewayStatus(options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<GatewayStatusPayload>(["gateway", "status", "--json"], options);
+  }
+
+  getModelStatus(options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<ModelsStatusPayload>(["models", "status", "--json"], options);
+  }
+
+  getAgentModelStatus(input: OpenClawAgentModelStatusInput, options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<ModelsStatusPayload>(
+      ["models", "status", "--agent", input.agentId, "--json"],
+      options
+    );
+  }
+
+  setModelAuthOrder(input: OpenClawModelAuthOrderSetInput, options: OpenClawCommandOptions = {}) {
+    return runOpenClaw(
+      [
+        "models",
+        "auth",
+        "order",
+        "set",
+        "--provider",
+        input.provider,
+        "--agent",
+        input.agentId,
+        ...input.profileIds
+      ],
+      options
+    );
+  }
+
+  async listAgents(options: OpenClawCommandOptions = {}) {
+    const agents = await runOpenClawJson<AgentPayload>(["agents", "list", "--json"], options);
+
+    return {
+      agents: agents.map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        identity: {
+          name: agent.identityName,
+          emoji: agent.identityEmoji
+        },
+        workspace: agent.workspace,
+        model: agent.model ? { primary: agent.model } : undefined
+      }))
+    } satisfies OpenClawAgentListPayload;
+  }
+
+  listSessions(input: OpenClawListSessionsInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawSessionsPayload>("sessions.list", { ...input }, options);
+  }
+
+  patchSessionModel(): Promise<OpenClawSessionModelPatchPayload> {
+    return Promise.reject(
+      new Error("Resetting a session model override requires native OpenClaw Gateway support; CLI fallback is disabled.")
+    );
+  }
+
+  describeSession(input: OpenClawDescribeSessionInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawSessionPayload>(
+      "sessions.describe",
+      {
+        ...buildSessionReferenceParams(input),
+        limit: input.limit
+      },
+      options
+    );
+  }
+
+  async getSessionHistory(input: OpenClawSessionHistoryInput = {}, options: OpenClawCommandOptions = {}) {
+    let lastError: unknown = null;
+    const candidates = [
+      ["chat.history", buildChatHistoryParams(input)] as const,
+      ["sessions.preview", buildSessionPreviewParams(input)] as const,
+      ["sessions.history", buildSessionHistoryParams(input)] as const
+    ];
+
+    for (const [method, params] of candidates) {
+      try {
+        return await this.call<OpenClawSessionHistoryPayload>(method, params, options);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError;
+  }
+
+  async exportSession(input: OpenClawSessionExportInput = {}, options: OpenClawCommandOptions = {}) {
+    let lastError: unknown = null;
+    const params = buildSessionReferenceParams(input);
+    const candidates = ["sessions.get", "sessions.describe", "sessions.export"];
+
+    for (const method of candidates) {
+      try {
+        const payload = await this.call<Record<string, unknown>>(
+          method,
+          method === "sessions.export" ? { ...params, format: input.format } : params,
+          options
+        );
+        return buildSessionExportPayload(input, payload);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError;
+  }
+
+  listTasks(input: OpenClawTaskListInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawTaskListPayload>("tasks.list", { ...input }, options);
+  }
+
+  getTask(input: OpenClawTaskGetInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawTaskPayload>("tasks.get", { ...input }, options);
+  }
+
+  assignTask(input: OpenClawTaskAssignInput, options: OpenClawCommandOptions = {}) {
+    void input;
+    void options;
+    return Promise.reject<OpenClawTaskPayload>(
+      new OpenClawGatewayClientError(
+        "The certified OpenClaw Gateway does not expose task assignment through Gateway or CLI.",
+        "unsupported"
+      )
+    );
+  }
+
+  cancelTask(input: OpenClawTaskCancelInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawTaskPayload>("tasks.cancel", { taskId: input.taskId, reason: input.reason ?? undefined }, options);
+  }
+
+  listArtifacts(input: OpenClawArtifactListInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawArtifactListPayload>("artifacts.list", buildArtifactListParams(input), options);
+  }
+
+  getArtifact(input: OpenClawArtifactGetInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawArtifactPayload>("artifacts.get", { ...input }, options);
+  }
+
+  downloadArtifact(input: OpenClawArtifactDownloadInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawArtifactDownloadPayload>("artifacts.download", { ...input }, options);
+  }
+
+  async putArtifact(
+    input: OpenClawArtifactPutInput,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawArtifactPayload> {
+    void input;
+    void options;
+    throw new Error(`Artifact writes are not part of the OpenClaw ${OPENCLAW_SUPPORTED_BASELINE_VERSION} Gateway baseline; native Gateway support must be explicitly advertised before AgentOS can use artifacts.put.`);
+  }
+
+  async deleteArtifact(
+    input: OpenClawArtifactDeleteInput,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawArtifactPayload> {
+    void input;
+    void options;
+    throw new Error(`Artifact deletion is not part of the OpenClaw ${OPENCLAW_SUPPORTED_BASELINE_VERSION} Gateway baseline; native Gateway support must be explicitly advertised before AgentOS can use artifacts.delete.`);
+  }
+
+  async getRuntimeSnapshot(input: OpenClawRuntimeSnapshotInput = {}, options: OpenClawCommandOptions = {}) {
+    const includeSessions = input.includeSessions !== false;
+    const includeTasks = input.includeTasks !== false;
+    const includeArtifacts = input.includeArtifacts !== false;
+    const artifactListInput = buildRuntimeSnapshotArtifactListInput(input);
+    const includeScopedArtifacts = includeArtifacts && hasArtifactListScope(artifactListInput);
+    const results = await Promise.allSettled([
+      includeSessions
+        ? this.listSessions({ limit: input.limit, agentId: input.agentId }, options)
+        : Promise.resolve(null),
+      includeTasks
+        ? this.listTasks({ limit: input.limit, agentId: input.agentId, workspace: input.workspace }, options)
+        : Promise.resolve(null),
+      includeScopedArtifacts
+        ? this.listArtifacts(artifactListInput, options)
+        : Promise.resolve(null)
+    ]);
+    const requestedResults = results.filter((result, index) =>
+      [includeSessions, includeTasks, includeScopedArtifacts][index]
+    );
+    const rejected = requestedResults.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+
+    if (requestedResults.length > 0 && rejected.length === requestedResults.length) {
+      throw rejected[0]?.reason ?? new Error("OpenClaw Gateway runtime snapshot failed.");
+    }
+
+    const [sessionsResult, tasksResult, artifactsResult] = results;
+    const payload: OpenClawRuntimeSnapshotPayload = {
+      sessions: sessionsResult.status === "fulfilled" ? sessionsResult.value?.sessions ?? [] : [],
+      tasks: tasksResult.status === "fulfilled" ? tasksResult.value?.tasks ?? [] : [],
+      artifacts: artifactsResult.status === "fulfilled" ? artifactsResult.value?.artifacts ?? [] : []
+    };
+
+    if (rejected.length > 0) {
+      payload.metadata = {
+        runtimeSnapshot: {
+          partial: true,
+          errors: rejected.map((result) => summarizeSnapshotError(result.reason))
+        }
+      };
+    }
+
+    return payload;
+  }
+
+  getToolsCatalog(input: OpenClawToolsCatalogInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawToolsCatalogPayload>("tools.catalog", { ...input }, options);
+  }
+
+  getEffectiveTools(input: OpenClawToolsEffectiveInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawToolsEffectivePayload>("tools.effective", { ...input }, options);
+  }
+
+  invokeTool(input: OpenClawToolInvokeInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawToolInvokePayload>("tools.invoke", { ...input }, options);
+  }
+
+  listCommands(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("commands.list", input, options);
+  }
+
+  getUsageStatus(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("usage.status", input, options);
+  }
+
+  getUsageCost(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("usage.cost", input, options);
+  }
+
+  getSessionUsage(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("sessions.usage", input, options);
+  }
+
+  getSessionUsageTimeseries(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("sessions.usage.timeseries", input, options);
+  }
+
+  getSessionUsageLogs(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("sessions.usage.logs", input, options);
+  }
+
+  getMemoryDoctorStatus(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("doctor.memory.status", input, options);
+  }
+
+  getMemoryDreamDiary(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("doctor.memory.dreamDiary", input, options);
+  }
+
+  listAgentFiles(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("agents.files.list", input, options);
+  }
+
+  getAgentFile(input: OpenClawGatewaySurfaceInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("agents.files.get", input, options);
+  }
+
+  setAgentFile(input: OpenClawGatewaySurfaceInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("agents.files.set", input, options);
+  }
+
+  listEnvironments(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("environments.list", input, options);
+  }
+
+  getEnvironmentStatus(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("environments.status", input, options);
+  }
+
+  getTalkCatalog(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("talk.catalog", input, options);
+  }
+
+  getTalkConfig(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("talk.config", input, options);
+  }
+
+  getTtsStatus(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("tts.status", input, options);
+  }
+
+  getTtsProviders(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("tts.providers", input, options);
+  }
+
+  listNodes(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("node.list", input, options);
+  }
+
+  describeNode(input: OpenClawGatewaySurfaceInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("node.describe", input, options);
+  }
+
+  invokeNode(input: OpenClawGatewaySurfaceInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("node.invoke", input, options);
+  }
+
+  listPluginApprovals(input: OpenClawGatewaySurfaceInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("plugin.approval.list", input, options);
+  }
+
+  resolvePluginApproval(input: OpenClawGatewaySurfaceInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawGatewaySurfacePayload>("plugin.approval.resolve", input, options);
+  }
+
+  async subscribeRuntimeEvents(
+    input: OpenClawRuntimeEventSubscriptionInput,
+    callbacks: OpenClawGatewayEventCallbacks,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawGatewayEventSubscription> {
+    void input;
+    void callbacks;
+    void options;
+    throw new Error("OpenClaw runtime event subscriptions require the native Gateway transport.");
+  }
+
+  getChannelStatus(input: OpenClawChannelStatusInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawChannelStatusPayload>("channels.status", { ...input }, options);
+  }
+
+  startWebLogin(input: OpenClawWebLoginStartInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawWebLoginResult>("web.login.start", { ...input }, options);
+  }
+
+  waitForWebLogin(input: OpenClawWebLoginWaitInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawWebLoginResult>("web.login.wait", { ...input }, options);
+  }
+
+  logoutChannel(input: OpenClawChannelLogoutInput, options: OpenClawCommandOptions = {}) {
+    return this.call<Record<string, unknown>>(
+      "channels.logout",
+      { channel: input.channel, accountId: input.accountId },
+      options
+    );
+  }
+
+  getChannelLogs(input: OpenClawChannelLogsInput, options: OpenClawCommandOptions = {}) {
+    const args = [
+      "channels",
+      "logs",
+      "--channel",
+      input.channel,
+      "--json"
+    ];
+
+    if (typeof input.lines === "number" && Number.isFinite(input.lines) && input.lines > 0) {
+      args.push("--lines", String(input.lines));
+    }
+
+    return runOpenClawJson<OpenClawChannelLogsPayload>(args, options);
+  }
+
+  provisionChannelAccount(input: OpenClawChannelAccountProvisionInput, options: OpenClawCommandOptions = {}) {
+    const args = [
+      "channels",
+      "add",
+      "--channel",
+      input.channel
+    ];
+
+    appendOptionalCliFlag(args, "--account", input.account);
+    appendOptionalCliFlag(args, "--token", input.token);
+    appendOptionalCliFlag(args, "--bot-token", input.botToken);
+    appendOptionalCliFlag(args, "--app-token", input.appToken);
+    appendOptionalCliFlag(args, "--webhook-url", input.webhookUrl);
+    appendOptionalCliFlag(args, "--name", input.name);
+
+    return runOpenClaw(args, options);
+  }
+
+  removeChannelAccount(input: OpenClawChannelAccountRemoveInput, options: OpenClawCommandOptions = {}) {
+    const args = [
+      "channels",
+      "remove",
+      "--channel",
+      input.channel,
+      "--account",
+      input.account
+    ];
+
+    if (input.delete) {
+      args.push("--delete");
+    }
+
+    return runOpenClaw(args, options);
+  }
+
+  setupGmailWebhook(input: OpenClawGmailSetupInput, options: OpenClawCommandOptions = {}) {
+    return runOpenClaw(buildGmailSetupArgs(input), options);
+  }
+
+  listSkills(options: OpenClawCommandOptions & { eligible?: boolean } = {}) {
+    const args = ["skills", "list"];
+    if (options.eligible) {
+      args.push("--eligible");
+    }
+    args.push("--json");
+    return runOpenClawJson<OpenClawSkillListPayload>(args, options);
+  }
+
+  listPlugins(options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<OpenClawPluginListPayload>(["plugins", "list", "--json"], options);
+  }
+
+  listModels(input: OpenClawListModelsInput = {}, options: OpenClawCommandOptions = {}) {
+    const args = ["models", "list"];
+    if (input.all) {
+      args.push("--all");
+    }
+    args.push("--json");
+    if (input.agentId) {
+      args.push("--agent", input.agentId);
+    }
+    if (input.provider) {
+      args.push("--provider", input.provider);
+    }
+    return runOpenClawJson<ModelsPayload>(args, options);
+  }
+
+  scanModels(options: OpenClawCommandOptions & { yes?: boolean; noInput?: boolean; noProbe?: boolean } = {}) {
+    const args = ["models", "scan", "--json"];
+    if (options.yes) {
+      args.push("--yes");
+    }
+    if (options.noInput) {
+      args.push("--no-input");
+    }
+    if (options.noProbe) {
+      args.push("--no-probe");
+    }
+    return runOpenClawJson<OpenClawModelScanPayload>(args, options);
+  }
+
+  probeGateway(options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<GatewayProbePayload>(["gateway", "probe", "--json"], options);
+  }
+
+  controlGateway(
+    action: "start" | "stop" | "restart",
+    options: OpenClawCommandOptions & { force?: boolean } = {}
+  ) {
+    const args = ["gateway", action];
+
+    if (action === "restart" && options.force) {
+      args.push("--force");
+    }
+
+    args.push("--json");
+
+    return runOpenClawJson<Record<string, unknown>>(args, options);
+  }
+
+  listDeviceAccess(options: OpenClawCommandOptions = {}): Promise<OpenClawDeviceListPayload> {
+    return runOpenClawJson<OpenClawDeviceListPayload>(["devices", "list", "--json"], options);
+  }
+
+  async approveDeviceAccess(
+    input: OpenClawDeviceApproveInput = {},
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawDeviceApprovePayload> {
+    if (input.latest !== false && !input.requestId) {
+      const list = await runOpenClawJson<Record<string, unknown>>(["devices", "list", "--json"], options);
+      const requestId = resolveLatestPendingDeviceRequestId(list);
+
+      if (!requestId) {
+        throw new Error("No pending OpenClaw device access request found.");
+      }
+
+      return this.approveDeviceAccess({
+        ...input,
+        latest: false,
+        requestId
+      }, options);
+    }
+
+    const args = ["devices", "approve"];
+
+    if (input.requestId) {
+      args.push(input.requestId);
+    }
+    for (const scope of input.scopes ?? []) {
+      appendOptionalCliFlag(args, "--scope", scope);
+    }
+    args.push("--json");
+
+    return runOpenClawJson<OpenClawDeviceApprovePayload>(args, options);
+  }
+
+  call<TPayload>(
+    method: string,
+    params: Record<string, unknown> = {},
+    options: OpenClawCommandOptions = {}
+  ) {
+    return runOpenClawJson<TPayload>(
+      ["gateway", "call", method, "--params", JSON.stringify(params), "--json"],
+      options
+    );
+  }
+
+  async getConfig<TPayload>(path: string, options: OpenClawCommandOptions = {}) {
+    return runOpenClawJson<TPayload>(["config", "get", path, "--json"], options).catch(() => null);
+  }
+
+  async getConfigSchema(options: OpenClawCommandOptions = {}) {
+    return this.call<Record<string, unknown>>("config.schema", {}, options).catch(() => null);
+  }
+
+  async lookupConfigSchema(input: OpenClawConfigSchemaLookupInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawConfigSchemaLookupPayload>("config.schema.lookup", { path: input.path }, options)
+      .catch(() => null);
+  }
+
+  async hasConfig(path: string, options: OpenClawCommandOptions = {}) {
+    try {
+      await runOpenClaw(["config", "get", path, "--json"], options);
+      return true;
+    } catch (error) {
+      const detail = stringifyCommandFailure(error);
+
+      if (detail.includes("Config path not found")) {
+        return false;
+      }
+
+      throw error;
+    }
+  }
+
+  setConfig(
+    path: string,
+    value: unknown,
+    options: OpenClawCommandOptions & { strictJson?: boolean } = {}
+  ) {
+    if (containsRedactedOpenClawSecret(value)) {
+      throw new Error("Refusing to write a redacted OpenClaw secret back to config.");
+    }
+
+    const args = ["config", "set", path, typeof value === "string" ? value : JSON.stringify(value)];
+
+    if (options.strictJson) {
+      args.push("--strict-json");
+    }
+
+    return runOpenClaw(args, options);
+  }
+
+  unsetConfig(path: string, options: OpenClawCommandOptions = {}) {
+    return runOpenClaw(["config", "unset", path], options);
+  }
+
+  addAgent(input: OpenClawAddAgentInput, options: OpenClawCommandOptions = {}) {
+    const args = [
+      "agents",
+      "add",
+      input.id,
+      "--workspace",
+      input.workspace,
+      "--agent-dir",
+      input.agentDir,
+      "--non-interactive",
+      "--json"
+    ];
+
+    if (input.model) {
+      args.push("--model", input.model);
+    }
+
+    return runOpenClaw(args, options);
+  }
+
+  async updateAgent(): Promise<CommandResult> {
+    throw new Error(
+      "OpenClaw agent update is unavailable: this OpenClaw CLI fallback does not expose a safe agent update command."
+    );
+  }
+
+  setAgentIdentity(input: OpenClawAgentIdentityInput, options: OpenClawCommandOptions = {}) {
+    return runOpenClaw(buildAgentIdentityArgs(input), options);
+  }
+
+  deleteAgent(agentId: string, options: OpenClawCommandOptions = {}) {
+    return runOpenClaw(["agents", "delete", agentId, "--force", "--json"], options);
+  }
+
+  provisionAutomation(input: OpenClawAutomationProvisionInput, options: OpenClawCommandOptions = {}) {
+    return runOpenClaw(buildAutomationProvisionArgs(input), options);
+  }
+
+  runAgentTurn(
+    input: OpenClawAgentTurnInput,
+    options: OpenClawCommandOptions = {}
+  ) {
+    return runOpenClawJson<MissionCommandPayload>(buildAgentTurnArgs(input), options);
+  }
+
+  abortAgentTurn(input: { runId?: string | null; sessionId?: string | null; agentId?: string | null; reason?: string | null }, options: OpenClawCommandOptions = {}) {
+    return this.call<MissionCommandPayload>("chat.abort", {
+      runId: input.runId ?? undefined,
+      sessionId: input.sessionId ?? undefined,
+      agentId: input.agentId ?? undefined,
+      reason: input.reason ?? undefined
+    }, options);
+  }
+
+  async steerSession(
+    input: OpenClawSessionSteerInput,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawSessionControlPayload> {
+    void input;
+    void options;
+    throw new Error("Native OpenClaw Gateway is required for chat.send steering.");
+  }
+
+  async injectChat(
+    input: OpenClawChatInjectInput,
+    options: OpenClawCommandOptions = {}
+  ): Promise<OpenClawSessionControlPayload> {
+    void input;
+    void options;
+    throw new Error("Native OpenClaw Gateway is required for chat.inject.");
+  }
+
+  streamAgentTurn(
+    input: OpenClawAgentTurnInput,
+    callbacks: OpenClawStreamCallbacks = {},
+    options: OpenClawCommandOptions = {}
+  ) {
+    return runOpenClawJsonStream<MissionCommandPayload>(buildAgentTurnArgs(input), {
+      ...options,
+      ...callbacks
+    });
+  }
+
+  tailLogs(input: OpenClawLogsTailInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawLogsTailPayload>("logs.tail", { ...input }, options);
+  }
+
+  listExecApprovals(input: OpenClawExecApprovalListInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawExecApprovalListPayload>("exec.approval.list", { ...input }, options);
+  }
+
+  resolveExecApproval(input: OpenClawExecApprovalResolveInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawExecApprovalResolvePayload>("exec.approval.resolve", {
+      approvalId: input.approvalId,
+      decision: input.decision,
+      reason: input.reason ?? undefined
+    }, options);
+  }
+
+  getCronStatus(options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawCronStatusPayload>("cron.status", {}, options);
+  }
+
+  listCronJobs(input: OpenClawCronListInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawCronListPayload>("cron.list", { ...input }, options);
+  }
+
+  getCronJob(input: OpenClawCronGetInput, options: OpenClawCommandOptions = {}) {
+    return this.call<Record<string, unknown>>("cron.get", { id: input.id }, options);
+  }
+
+  runCronJob(input: OpenClawCronRunInput, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawCronRunPayload>("cron.run", {
+      id: input.id,
+      mode: input.mode,
+      expectedProcessInstanceId: input.expectedProcessInstanceId
+    }, options);
+  }
+
+  listCronRuns(input: OpenClawCronRunsInput = {}, options: OpenClawCommandOptions = {}) {
+    return this.call<OpenClawCronRunsPayload>("cron.runs", { ...input }, options);
+  }
+}
+
+function resolveLatestPendingDeviceRequestId(payload: Record<string, unknown>) {
+  const pending = Array.isArray(payload.pending) ? payload.pending : [];
+  let selected: { requestId: string; ts: number } | null = null;
+
+  for (const entry of pending) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const requestId = typeof record.requestId === "string" && record.requestId.trim()
+      ? record.requestId.trim()
+      : null;
+
+    if (!requestId) {
+      continue;
+    }
+
+    const ts = typeof record.ts === "number" && Number.isFinite(record.ts) ? record.ts : 0;
+
+    if (!selected || ts > selected.ts) {
+      selected = { requestId, ts };
+    }
+  }
+
+  return selected?.requestId ?? null;
+}
+
+function requireMemoryAgentId(input: OpenClawMemoryAgentInput) {
+  const agentId = input.agentId?.trim();
+  if (!agentId) {
+    throw new Error("OpenClaw memory index status requires an explicit agent id.");
+  }
+  return agentId;
+}
+
+function createUnavailableMemoryIndexStatus(
+  agentId: string,
+  locality: MemoryCliFallbackLocality
+): OpenClawMemoryIndexStatusPayload {
+  return {
+    agentId,
+    backend: null,
+    files: null,
+    chunks: null,
+    dirty: null,
+    lastSyncError: null,
+    sourceCounts: null,
+    indexIdentity: null,
+    appliedVia: null,
+    availability: "unavailable",
+    locality: locality.capability,
+    localityReason: locality.reason
+  };
+}
+
+function normalizeMemoryIndexStatus(raw: unknown, agentId: string): OpenClawMemoryIndexStatusPayload {
+  const records: Array<Record<string, unknown>> = Array.isArray(raw)
+    ? raw.filter(isObjectRecord)
+    : isObjectRecord(raw) ? [raw] : [];
+  const record = records.find((candidate) => candidate.agentId === agentId) ?? records[0];
+  const status = record && isObjectRecord(record.status) ? record.status : null;
+  if (!status) {
+    throw new Error("OpenClaw memory status returned an invalid agent status payload.");
+  }
+
+  const sourceCounts = Array.isArray(status.sourceCounts)
+    ? Object.fromEntries(
+        status.sourceCounts
+          .filter(isObjectRecord)
+          .map((source: Record<string, unknown>) => {
+            const sourceName = typeof source.source === "string" ? source.source : null;
+            const files = typeof source.files === "number" && Number.isFinite(source.files)
+              ? source.files
+              : null;
+            return sourceName && files !== null ? [sourceName, files] as [string, number] : null;
+          })
+          .filter((entry): entry is [string, number] => entry !== null)
+      )
+    : null;
+  const identity = isObjectRecord(status.custom) && isObjectRecord(status.custom.indexIdentity)
+    ? status.custom.indexIdentity
+    : null;
+
+  return {
+    agentId,
+    backend: typeof status.backend === "string" ? status.backend : null,
+    files: readFiniteNumber(status.files),
+    chunks: readFiniteNumber(status.chunks),
+    dirty: typeof status.dirty === "boolean" ? status.dirty : null,
+    lastSyncError: typeof status.lastSyncError === "string"
+      ? redactSecretText(status.lastSyncError)
+      : null,
+    sourceCounts,
+    indexIdentity: identity
+      ? {
+          status: readString(identity.status),
+          code: readString(identity.code),
+          owner: readString(identity.owner),
+          reason: readString(identity.reason)
+        }
+      : null,
+    appliedVia: "cli-fallback",
+    availability: "available",
+    locality: "available-local-same-runtime",
+    localityReason: null
+  };
+}
+
+function readFiniteNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readString(value: unknown) {
+  return typeof value === "string" ? value : null;
+}

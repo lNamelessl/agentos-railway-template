@@ -1,0 +1,237 @@
+import { getMissionControlSnapshot } from "@/lib/agentos/control-plane";
+import {
+  getOpenClawEventBridgeStreamStatus,
+  getOpenClawAttentionRevision,
+  isHumanControlAttentionEvent,
+  subscribeOpenClawEventBridgeEvents
+} from "@/lib/openclaw/application/event-bridge-service";
+import { redactErrorMessage, redactSecrets } from "@/lib/security/redaction";
+import {
+  probeLocalGatewayConfiguration,
+  probeLocalGatewayRegistration,
+  probeLocalGatewayStatus
+} from "@/lib/openclaw/client/local-gateway-probe";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const encoder = new TextEncoder();
+const STREAM_RECONCILIATION_INTERVAL_MS = 60_000;
+const STREAM_EVENT_DEBOUNCE_MS = 300;
+const STREAM_SYSTEM_STATUS_INTERVAL_MS = 10_000;
+const STREAM_INITIAL_SNAPSHOT_DELAY_MS = 0;
+
+export async function GET(request: Request) {
+  let interval: ReturnType<typeof setInterval> | undefined;
+  let systemStatusInterval: ReturnType<typeof setInterval> | undefined;
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let unsubscribeGatewayEvents: (() => void) | undefined;
+  let closed = false;
+  let snapshotTask: Promise<void> | null = null;
+  let systemStatusTask: Promise<void> | null = null;
+  let cliInstalled: boolean | null = null;
+  let gatewayRegistered: boolean | null = null;
+  let gatewayConfigured: boolean | null = null;
+  let runtimeWritable: boolean | null = null;
+  let modelStatus = { checked: false, defaultModelId: null as string | null, modelIds: [] as string[] };
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const handleAbort = () => {
+        close();
+      };
+
+      const cleanup = () => {
+        if (interval) {
+          clearInterval(interval);
+          interval = undefined;
+        }
+        if (systemStatusInterval) {
+          clearInterval(systemStatusInterval);
+          systemStatusInterval = undefined;
+        }
+        if (debounceTimer) {
+          clearTimeout(debounceTimer);
+          debounceTimer = undefined;
+        }
+        unsubscribeGatewayEvents?.();
+        unsubscribeGatewayEvents = undefined;
+
+        request.signal.removeEventListener("abort", handleAbort);
+      };
+
+      const sendEvent = (event: string, data: unknown) => {
+        if (closed) {
+          return false;
+        }
+
+        try {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(redactSecrets(data))}\n\n`));
+          return true;
+        } catch {
+          close();
+          return false;
+        }
+      };
+
+      const close = () => {
+        if (closed) {
+          return;
+        }
+
+        closed = true;
+        cleanup();
+
+        try {
+          controller.close();
+        } catch {
+          // Stream may already be closed by the runtime.
+        }
+      };
+
+      request.signal.addEventListener("abort", handleAbort);
+
+      const sendSnapshot = async () => {
+        if (closed) {
+          return;
+        }
+
+        if (snapshotTask) {
+          return snapshotTask;
+        }
+
+        snapshotTask = (async () => {
+          try {
+            const snapshot = await getMissionControlSnapshot();
+            sendEvent("snapshot", snapshot);
+          } catch (error) {
+            sendEvent("error", {
+              error: redactErrorMessage(error, "Unknown stream error.")
+            });
+          } finally {
+            snapshotTask = null;
+          }
+        })();
+
+        return snapshotTask;
+      };
+
+      const scheduleSnapshot = (delayMs: number) => {
+        if (closed) {
+          return;
+        }
+
+        if (debounceTimer) {
+          clearTimeout(debounceTimer);
+        }
+
+        debounceTimer = setTimeout(() => {
+          debounceTimer = undefined;
+          void sendSnapshot();
+        }, delayMs);
+      };
+
+      const sendSystemStatus = () => {
+        if (systemStatusTask) {
+          return systemStatusTask;
+        }
+
+        systemStatusTask = (async () => {
+          const [gatewayStatus, detectedGatewayRegistered, detectedGatewayConfigured, detectedCliInstalled] = await Promise.all([
+          probeLocalGatewayStatus().catch(() => null),
+          gatewayRegistered === true
+            ? Promise.resolve(true)
+            : probeLocalGatewayRegistration().catch(() => null),
+          gatewayConfigured === true
+            ? Promise.resolve(true)
+            : probeLocalGatewayConfiguration().catch(() => false),
+          cliInstalled === true
+            ? Promise.resolve(true)
+            : import("@/lib/openclaw/cli")
+                .then(({ resolveOpenClawBin }) => resolveOpenClawBin().then(() => true).catch(() => false))
+                .catch(() => false)
+        ]);
+        cliInstalled = detectedCliInstalled;
+        gatewayRegistered = detectedGatewayRegistered;
+        gatewayConfigured = detectedGatewayConfigured;
+        const gatewayReady = gatewayStatus?.rpc?.ok === true;
+
+        if (gatewayReady && !modelStatus.checked) {
+          modelStatus = await import("@/lib/openclaw/state/local-model-status")
+            .then(({ probeLocalDefaultModel }) => probeLocalDefaultModel())
+            .catch(() => modelStatus);
+        }
+
+        if (gatewayReady && runtimeWritable !== true) {
+          runtimeWritable = await Promise.all([
+            import("@/lib/openclaw/state/runtime-state"),
+            import("@/lib/openclaw/state/paths")
+          ]).then(async ([runtimeState, statePaths]) => {
+            const result = await runtimeState.inspectOpenClawRuntimeState(
+              statePaths.openClawStateRootPath,
+              [],
+              { touch: true }
+            );
+            return result.stateWritable && result.sessionStoreWritable;
+          }).catch(() => false);
+        }
+
+          sendEvent("system-status", {
+            gatewayReachable: Boolean(gatewayStatus),
+            gatewayReady,
+            gatewayRegistered,
+            gatewayConfigured,
+            cliInstalled,
+            runtimeWritable,
+            modelStatus
+          });
+        })().finally(() => {
+          systemStatusTask = null;
+        });
+
+        return systemStatusTask;
+      };
+
+      unsubscribeGatewayEvents = subscribeOpenClawEventBridgeEvents((frame) => {
+        void sendSystemStatus();
+        if (isHumanControlAttentionEvent(frame)) {
+          sendEvent("attention", { revision: getOpenClawAttentionRevision() });
+        }
+        scheduleSnapshot(STREAM_EVENT_DEBOUNCE_MS);
+      });
+
+      interval = setInterval(() => {
+        void sendSnapshot();
+      }, STREAM_RECONCILIATION_INTERVAL_MS);
+
+      sendEvent("ready", {
+        ok: true,
+        eventBridge: getOpenClawEventBridgeStreamStatus()
+      });
+      void sendSystemStatus();
+      systemStatusInterval = setInterval(() => {
+        void sendSystemStatus();
+      }, STREAM_SYSTEM_STATUS_INTERVAL_MS);
+      scheduleSnapshot(STREAM_INITIAL_SNAPSHOT_DELAY_MS);
+    },
+    cancel() {
+      closed = true;
+
+      if (interval) {
+        clearInterval(interval);
+      }
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+      }
+      unsubscribeGatewayEvents?.();
+    }
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive"
+    }
+  });
+}

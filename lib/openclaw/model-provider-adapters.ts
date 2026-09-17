@@ -1,0 +1,264 @@
+"use client";
+
+import {
+  getModelProviderDescriptor,
+  type ModelProviderDescriptor
+} from "@/lib/openclaw/model-provider-registry";
+import type {
+  AddModelsProviderActionRequest,
+  AddModelsProviderActionResult,
+  AddModelsProviderId,
+  ModelProviderAuthMethod
+} from "@/lib/openclaw/types";
+import type { ChatGptBrowserAuthSnapshot } from "@/lib/agentos/contracts";
+
+export type ModelProviderAdapter = {
+  id: AddModelsProviderId;
+  descriptor: ModelProviderDescriptor;
+  getConnectionStatus: (input?: { agentId?: string | null }) => Promise<AddModelsProviderActionResult>;
+  connect: (input?: { apiKey?: string; endpoint?: string; providerName?: string; modelId?: string; force?: boolean; authMethod?: ModelProviderAuthMethod; agentId?: string | null }) => Promise<AddModelsProviderActionResult>;
+  updateProvider: (input: { endpoint?: string | null; api?: string }) => Promise<AddModelsProviderActionResult>;
+  replaceCredential: (apiKey: string) => Promise<AddModelsProviderActionResult>;
+  switchAccount: () => Promise<AddModelsProviderActionResult>;
+  discoverModels: (input?: { agentId?: string | null }) => Promise<AddModelsProviderActionResult>;
+  addModels: (modelIds: string[]) => Promise<AddModelsProviderActionResult>;
+  getDisconnectImpact: () => Promise<AddModelsProviderActionResult>;
+  disconnect: () => Promise<AddModelsProviderActionResult>;
+  getCredentialDisconnectImpact: () => Promise<AddModelsProviderActionResult>;
+  disconnectCredential: () => Promise<AddModelsProviderActionResult>;
+  getDeleteImpact: () => Promise<AddModelsProviderActionResult>;
+  deleteProvider: () => Promise<AddModelsProviderActionResult>;
+};
+
+export class ModelProviderActionError extends Error {
+  constructor(
+    message: string,
+    readonly result: AddModelsProviderActionResult | null
+  ) {
+    super(message);
+    this.name = "ModelProviderActionError";
+  }
+}
+
+const MODEL_PROVIDER_REQUEST_TIMEOUT_MS = 30_000;
+const CHATGPT_PROVIDER_REQUEST_TIMEOUT_MS = 13 * 60_000;
+
+async function runChatGptBrowserAuthRequest(
+  request:
+    | { action: "start"; force?: boolean; agentId?: string }
+    | { action: "submit"; sessionId: string; redirectUrl: string }
+): Promise<ChatGptBrowserAuthSnapshot> {
+  const response = await fetch("/api/models/chatgpt-auth", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(request)
+  });
+  const result = (await response.json().catch(() => null)) as
+    | ChatGptBrowserAuthSnapshot
+    | { error?: string }
+    | null;
+
+  if (!result) {
+    throw new Error("ChatGPT sign-in request failed.");
+  }
+
+  if (!("sessionId" in result)) {
+    throw new Error(result.error || "ChatGPT sign-in request failed.");
+  }
+
+  if (!response.ok) {
+    throw new Error("ChatGPT sign-in request failed.");
+  }
+
+  return result;
+}
+
+export function startChatGptBrowserAuth(force = false, agentId?: string | null) {
+  return runChatGptBrowserAuthRequest({
+    action: "start",
+    force: force || undefined,
+    agentId: agentId?.trim() || undefined
+  });
+}
+
+export async function readChatGptBrowserAuth(sessionId: string) {
+  const response = await fetch(`/api/models/chatgpt-auth?sessionId=${encodeURIComponent(sessionId)}`, {
+    cache: "no-store"
+  });
+  const result = (await response.json().catch(() => null)) as
+    | ChatGptBrowserAuthSnapshot
+    | { error?: string }
+    | null;
+
+  if (!result) {
+    throw new Error("ChatGPT sign-in status failed.");
+  }
+
+  if (!("sessionId" in result)) {
+    throw new Error(result.error || "ChatGPT sign-in status failed.");
+  }
+
+  if (!response.ok) {
+    throw new Error("ChatGPT sign-in status failed.");
+  }
+
+  return result;
+}
+
+export function submitChatGptBrowserAuth(sessionId: string, redirectUrl: string) {
+  return runChatGptBrowserAuthRequest({
+    action: "submit",
+    sessionId,
+    redirectUrl
+  });
+}
+
+async function runProviderAction(
+  request: AddModelsProviderActionRequest,
+  options?: { allowNotOk?: boolean }
+): Promise<AddModelsProviderActionResult> {
+  let response: Response;
+
+  try {
+    response = await fetch("/api/models/providers", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(
+        request.provider === "openai" &&
+        ((request.action === "connect" && request.authMethod === "chatgpt-oauth") || request.action === "switch-account")
+          ? CHATGPT_PROVIDER_REQUEST_TIMEOUT_MS
+          : MODEL_PROVIDER_REQUEST_TIMEOUT_MS
+      )
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new Error("Model provider request timed out. Check OpenClaw Gateway status and try again.");
+    }
+
+    throw error;
+  }
+
+  const result = (await response.json().catch(() => null)) as
+    | (AddModelsProviderActionResult & { error?: string })
+    | null;
+
+  if (!response.ok || !result) {
+    if (options?.allowNotOk && result) {
+      return result;
+    }
+    throw new Error(result?.error || result?.message || "Model provider request failed.");
+  }
+
+  if (!result.ok && result.message && !options?.allowNotOk) {
+    throw new ModelProviderActionError(result.message, result);
+  }
+
+  return result;
+}
+
+function createModelProviderAdapter(providerId: AddModelsProviderId): ModelProviderAdapter {
+  return {
+    id: providerId,
+    descriptor: getModelProviderDescriptor(providerId),
+    getConnectionStatus: (input) =>
+      runProviderAction({
+        action: "status",
+        provider: providerId,
+        agentId: input?.agentId?.trim() || undefined
+      }),
+    connect: (input) =>
+      runProviderAction({
+        action: "connect",
+        provider: providerId,
+        authMethod: input?.authMethod,
+        providerName: input?.providerName?.trim() ? input.providerName.trim() : undefined,
+        apiKey: input?.apiKey?.trim() ? input.apiKey.trim() : undefined,
+        endpoint: input?.endpoint?.trim() ? input.endpoint.trim() : undefined,
+        modelId: input?.modelId?.trim() ? input.modelId.trim() : undefined,
+        force: input?.force === true ? true : undefined,
+        agentId: input?.agentId?.trim() ? input.agentId.trim() : undefined
+      }),
+    updateProvider: (input) =>
+      runProviderAction({
+        action: "update-provider",
+        provider: providerId,
+        endpoint: input.endpoint,
+        api: input.api
+      }),
+    replaceCredential: (apiKey) =>
+      runProviderAction({
+        action: "replace-credential",
+        provider: providerId,
+        apiKey
+      }),
+    switchAccount: () =>
+      runProviderAction({
+        action: "switch-account",
+        provider: providerId
+      }),
+    discoverModels: (input) =>
+      runProviderAction({
+        action: "discover",
+        provider: providerId,
+        agentId: input?.agentId?.trim() || undefined
+      }),
+    addModels: (modelIds) =>
+      runProviderAction({
+        action: "add-models",
+        provider: providerId,
+        modelIds
+      }),
+    getDisconnectImpact: () =>
+      runProviderAction({
+        action: "disconnect-impact",
+        provider: providerId
+      }, { allowNotOk: true }),
+    disconnect: () =>
+      runProviderAction({
+        action: "disconnect",
+        provider: providerId,
+        confirmed: true
+      }),
+    getCredentialDisconnectImpact: () =>
+      runProviderAction({
+        action: "disconnect-credential-impact",
+        provider: providerId
+      }, { allowNotOk: true }),
+    disconnectCredential: () =>
+      runProviderAction({
+        action: "disconnect-credential",
+        provider: providerId,
+        confirmed: true
+      }),
+    getDeleteImpact: () =>
+      runProviderAction({
+        action: "delete-provider-impact",
+        provider: providerId
+      }, { allowNotOk: true }),
+    deleteProvider: () =>
+      runProviderAction({
+        action: "delete-provider",
+        provider: providerId,
+        confirmed: true
+      })
+  };
+}
+
+const modelProviderAdapters = new Map<string, ModelProviderAdapter>();
+
+export function getModelProviderAdapter(providerId: AddModelsProviderId) {
+  const cached = modelProviderAdapters.get(providerId);
+
+  if (cached) {
+    return cached;
+  }
+
+  const adapter = createModelProviderAdapter(providerId);
+  modelProviderAdapters.set(providerId, adapter);
+  return adapter;
+}

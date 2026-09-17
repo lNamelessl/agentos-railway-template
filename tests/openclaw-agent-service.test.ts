@@ -1,0 +1,243 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { test } from "node:test";
+
+import {
+  assertAgentModelReadyForAssignment,
+  createAgent as createApplicationAgent,
+  deleteAgent as deleteApplicationAgent,
+  formatPostCreateAgentConfigSyncWarning,
+  resolveAgentCreateModelSelection,
+  resolveWorkerProfileUpdatePatch,
+  updateAgent as updateApplicationAgent
+} from "@/lib/openclaw/application/agent-service";
+import {
+  createAgent as createCompatibilityAgent,
+  deleteAgent as deleteCompatibilityAgent,
+  updateAgent as updateCompatibilityAgent
+} from "@/lib/openclaw/service";
+import type { MissionControlSnapshot } from "@/lib/agentos/contracts";
+
+async function readErrorMessage(action: () => Promise<unknown>) {
+  try {
+    await action();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  throw new Error("Expected action to throw.");
+}
+
+test("agent application service preserves create validation shape", async () => {
+  const input = {
+    id: " ",
+    workspaceId: "workspace:missing"
+  };
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationAgent(input)),
+    await readErrorMessage(() => createCompatibilityAgent(input))
+  );
+});
+
+test("agent application service preserves update validation shape", async () => {
+  const input = {
+    id: " "
+  };
+
+  assert.equal(
+    await readErrorMessage(() => updateApplicationAgent(input)),
+    await readErrorMessage(() => updateCompatibilityAgent(input))
+  );
+});
+
+test("agent application service preserves delete validation shape", async () => {
+  const input = {
+    agentId: " "
+  };
+
+  assert.equal(
+    await readErrorMessage(() => deleteApplicationAgent(input)),
+    await readErrorMessage(() => deleteCompatibilityAgent(input))
+  );
+});
+
+test("agent creation treats post-create Gateway config timeouts as sync warnings", () => {
+  const warning = formatPostCreateAgentConfigSyncWarning(
+    new Error(
+      'Timed out waiting for OpenClaw Gateway method "config.patch". Gateway-native operation failed; CLI fallback disabled for this operation.'
+    )
+  );
+
+  assert.match(warning ?? "", /AgentOS created the agent/);
+  assert.match(warning ?? "", /config sync/);
+});
+
+test("agent creation does not downgrade validation failures to sync warnings", () => {
+  assert.equal(
+    formatPostCreateAgentConfigSyncWarning(new Error('Agent id "main" already exists in workspace "Workspace".')),
+    null
+  );
+  assert.equal(
+    formatPostCreateAgentConfigSyncWarning(new Error("Refusing to write a redacted OpenClaw secret.")),
+    null
+  );
+});
+
+test("agent creation reconciles stale global model readiness through native agent evidence", () => {
+  const source = readFileSync(
+    path.join(process.cwd(), "lib/openclaw/application/agent-service.ts"),
+    "utf8"
+  );
+
+  assert.match(source, /isOpenClawAgentModelReady/);
+  assert.match(source, /resolveAgentCreationReadinessErrorWithNativeAgentEvidence/);
+  assert.match(source, /candidateAgentIds: resolveAgentNativeReadinessAgentIds/);
+});
+
+test("agent creation uses a workspace-aware display-name fallback when the API caller omits a name", () => {
+  const source = readFileSync(
+    path.join(process.cwd(), "lib/openclaw/application/agent-service.ts"),
+    "utf8"
+  );
+
+  assert.match(source, /buildUniqueAgentName\(snapshot\.agents, resolvedWorkspaceId/);
+});
+
+test("agent creation falls back when the requested model is not ready", () => {
+  const snapshot = {
+    diagnostics: {
+      installed: true,
+      rpcOk: true,
+      runtime: {
+        stateWritable: true,
+        sessionStoreWritable: true,
+        issues: []
+      },
+      modelReadiness: {
+        ready: true,
+        defaultModelReady: true,
+        defaultModel: "openai/gpt-5.5",
+        resolvedDefaultModel: "openai/gpt-5.5",
+        recommendedModelId: "openai/gpt-5.5",
+        totalModelCount: 2,
+        availableModelCount: 1,
+        issues: []
+      }
+    },
+    agents: [],
+    models: [
+      {
+        id: "openai/gpt-5.4-mini",
+        available: false,
+        missing: false
+      },
+      {
+        id: "openai/gpt-5.5",
+        available: true,
+        missing: false
+      }
+    ]
+  } as unknown as MissionControlSnapshot;
+
+  const selection = resolveAgentCreateModelSelection(snapshot, "openai/gpt-5.4-mini", "openai/gpt-5.5");
+
+  assert.equal(selection.modelId, "openai/gpt-5.5");
+  assert.equal(selection.warnings.length, 1);
+  assert.match(selection.warnings[0], /Requested model openai\/gpt-5\.4-mini is not ready/);
+});
+
+test("agent model assignment rejects unavailable and missing models", () => {
+  const snapshot = {
+    diagnostics: {
+      installed: true,
+      rpcOk: true,
+      runtime: {
+        stateWritable: true,
+        sessionStoreWritable: true,
+        issues: []
+      },
+      modelReadiness: {
+        ready: true,
+        defaultModelReady: true,
+        defaultModel: "openai/gpt-5.5",
+        resolvedDefaultModel: "openai/gpt-5.5"
+      }
+    },
+    agents: [],
+    models: [
+      {
+        id: "openai/gpt-5.4-mini",
+        available: false,
+        missing: false
+      },
+      {
+        id: "openai/gpt-5.5",
+        available: true,
+        missing: false
+      }
+    ]
+  } as unknown as MissionControlSnapshot;
+
+  assert.throws(
+    () => assertAgentModelReadyForAssignment(snapshot, "openai/gpt-5.4-mini"),
+    /OpenClaw|not ready|Configure/
+  );
+  assert.throws(
+    () => assertAgentModelReadyForAssignment(snapshot, "google/gemini-3.5-flash"),
+    /OpenClaw|not ready|Configure/
+  );
+  assert.doesNotThrow(() => assertAgentModelReadyForAssignment(snapshot, "openai/gpt-5.5"));
+});
+
+test("legacy identity updates also patch the AgentOS Worker Profile", () => {
+  const patch = resolveWorkerProfileUpdatePatch({
+    id: "research-worker",
+    theme: "violet",
+    name: "Research Worker"
+  });
+
+  assert.deepEqual(patch?.identity, {
+    displayName: "Research Worker",
+    emoji: undefined,
+    theme: "violet",
+    avatar: undefined
+  });
+});
+
+test("explicit Worker Profile identity values take precedence over legacy fields", () => {
+  const patch = resolveWorkerProfileUpdatePatch({
+    id: "research-worker",
+    theme: "violet",
+    workerProfile: {
+      schemaVersion: 1,
+      identity: { theme: null }
+    }
+  });
+
+  assert.equal(patch?.identity?.theme, null);
+});
+
+test("capability updates keep their freshly written agent config instead of replaying a stale workspace snapshot", () => {
+  const source = readFileSync(
+    path.join(process.cwd(), "lib/openclaw/application/agent-service.ts"),
+    "utf8"
+  );
+  const updateAgentSource = source.slice(
+    source.indexOf("export async function updateAgent"),
+    source.indexOf("export async function deleteAgent")
+  );
+  const modelOnlyBranch = updateAgentSource.slice(
+    updateAgentSource.indexOf("if (onlyModelChanged)"),
+    updateAgentSource.indexOf("const policySkillId")
+  );
+
+  assert.match(updateAgentSource, /skills: uniqueStrings\(\[\.\.\.nextDeclaredSkills, policySkillId\]\)/);
+  assert.match(updateAgentSource, /checking agent skill configuration access/);
+  assert.match(updateAgentSource, /assertGatewayNativeConfigMutationAccess/);
+  assert.match(updateAgentSource, /assertAgentSkillConfigPersisted\(agentId, nextDeclaredSkills(?:, gatewayOptions)?\)/);
+  assert.match(updateAgentSource, /invalidateMissionControlSnapshotCache\(\);/);
+  assert.match(modelOnlyBranch, /if \(!updatedViaGateway\) \{\s+await upsertAgentConfigEntryWithRecovery\(/);
+  assert.doesNotMatch(updateAgentSource, /syncWorkspaceAgentPolicySkills\(resolvedWorkspacePath\)/);
+});

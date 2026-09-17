@@ -1,0 +1,349 @@
+import type {
+  AgentConfigPayload,
+  ModelsPayload,
+  ModelsStatusPayload
+} from "@/lib/openclaw/client/gateway-client";
+import {
+  buildModelStatusConnectionStatus,
+  isUnsupportedLegacyModelId,
+  modelRecordIdentityKey,
+  normalizeOpenAiModelId,
+  resolveModelRecordProvider
+} from "@/lib/openclaw/domains/model-provider-connection";
+import { isAddModelsProviderId } from "@/lib/openclaw/model-provider-registry";
+import type { ModelRecord, OpenClawAgent } from "@/lib/openclaw/types";
+
+type AgentModelDefaultLike = {
+  model?: string | null;
+  modelId?: string | null;
+  isDefault?: boolean | null;
+};
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+export function buildModelsPayloadFromFallbackSources(
+  agentConfig: AgentConfigPayload,
+  modelStatus?: ModelsStatusPayload,
+  configuredModelIds: Iterable<string> = []
+): ModelsPayload {
+  const modelIds = uniqueStrings([
+    ...Array.from(configuredModelIds),
+    ...agentConfig.map((entry) => entry.model ?? "").filter(Boolean),
+    ...(modelStatus?.allowed ?? []).filter(Boolean),
+    modelStatus?.resolvedDefault ?? "",
+    modelStatus?.defaultModel ?? ""
+  ]);
+
+  return {
+    models: modelIds.map((modelId) => {
+      const fallbackMetadata = inferFallbackModelMetadata(modelId);
+
+      return {
+        key: modelId,
+        name: modelId,
+        input: "text",
+        contextWindow: fallbackMetadata.contextWindow,
+        local: fallbackMetadata.local,
+        available: true,
+        tags: [],
+        missing: false
+      };
+    })
+  };
+}
+
+export function mergeConfiguredModelsIntoModelsPayload(
+  models: ModelsPayload["models"],
+  configuredModelIds: Iterable<string>
+): ModelsPayload["models"] {
+  const seenModelIds = new Set(models.map((model) => normalizeOpenAiModelId(model.key).toLowerCase()));
+  const mergedModels = [...models];
+
+  for (const modelId of configuredModelIds) {
+    const normalizedModelId = normalizeOpenAiModelId(modelId);
+
+    if (!normalizedModelId || seenModelIds.has(normalizedModelId.toLowerCase())) {
+      continue;
+    }
+
+    const fallbackMetadata = inferFallbackModelMetadata(normalizedModelId);
+
+    mergedModels.push({
+      key: normalizedModelId,
+      name: normalizedModelId,
+      input: "text",
+      contextWindow: fallbackMetadata.contextWindow,
+      local: fallbackMetadata.local,
+      available: true,
+      tags: [],
+      missing: false
+    });
+    seenModelIds.add(normalizedModelId.toLowerCase());
+  }
+
+  return mergedModels;
+}
+
+export function filterModelsToConfiguredSelection(
+  models: ModelsPayload["models"],
+  configuredModelIds: Iterable<string>,
+  agents: AgentModelDefaultLike[] = []
+): ModelsPayload["models"] {
+  const selectedModelIds = new Set(
+    [
+      ...Array.from(configuredModelIds),
+      ...agents.map((agent) => readAgentModel(agent) ?? "")
+    ]
+      .map((modelId) => normalizeOpenAiModelId(modelId).toLowerCase())
+      .filter(Boolean)
+  );
+
+  return models.filter((model) =>
+    selectedModelIds.has(normalizeOpenAiModelId(model.key).toLowerCase())
+  );
+}
+
+export function inferFallbackModelMetadata(modelId: string): {
+  contextWindow: number | null;
+  local: boolean | null;
+} {
+  const normalized = modelId.trim().toLowerCase();
+  const provider = normalized.split("/", 1)[0] || "";
+  const route = normalized.includes("/") ? normalized.slice(provider.length + 1) : normalized;
+
+  if (provider === "ollama") {
+    return {
+      contextWindow: inferOllamaContextWindow(route),
+      local: true
+    };
+  }
+
+  if (provider === "openai") {
+    return {
+      contextWindow: route.startsWith("gpt-5") ? 272000 : null,
+      local: false
+    };
+  }
+
+  if (provider === "anthropic") {
+    return {
+      contextWindow: 200000,
+      local: false
+    };
+  }
+
+  if (provider === "google" || provider === "gemini") {
+    return {
+      contextWindow: 1000000,
+      local: false
+    };
+  }
+
+  if (provider === "deepseek") {
+    return {
+      contextWindow: 64000,
+      local: false
+    };
+  }
+
+  if (provider === "mistral") {
+    return {
+      contextWindow: 128000,
+      local: false
+    };
+  }
+
+  if (provider === "openrouter" || provider === "xai") {
+    return {
+      contextWindow: null,
+      local: false
+    };
+  }
+
+  return {
+    contextWindow: null,
+    local: null
+  };
+}
+
+function inferOllamaContextWindow(route: string) {
+  if (route.includes("qwen3.5")) {
+    return 262144;
+  }
+
+  if (
+    route.includes("qwen") ||
+    route.includes("llama3.2") ||
+    route.includes("llama3.3") ||
+    route.includes("deepseek-r1")
+  ) {
+    return 131072;
+  }
+
+  return 131072;
+}
+
+export function buildModelStatusFromAgentConfig(
+  agentConfig: AgentConfigPayload,
+  agents: AgentModelDefaultLike[] = []
+): ModelsStatusPayload | undefined {
+  const defaultModel =
+    readAgentModel(agents.find((entry) => entry.isDefault)) ||
+    readAgentModel(agents.find((entry) => Boolean(readAgentModel(entry)))) ||
+    agentConfig.find((entry) => entry.default)?.model ||
+    agentConfig.find((entry) => Boolean(entry.model))?.model ||
+    null;
+
+  if (!defaultModel) {
+    return undefined;
+  }
+
+  return {
+    defaultModel,
+    resolvedDefault: defaultModel
+  };
+}
+
+export function mergeModelStatusWithAgentConfigDefaults(
+  modelStatus: ModelsStatusPayload | undefined,
+  agentConfig: AgentConfigPayload,
+  agents: AgentModelDefaultLike[] = []
+): ModelsStatusPayload | undefined {
+  const fallbackStatus = buildModelStatusFromAgentConfig(agentConfig, agents);
+
+  if (!modelStatus) {
+    return fallbackStatus;
+  }
+
+  const defaultModel = normalizeModelId(modelStatus.defaultModel) ??
+    normalizeModelId(fallbackStatus?.defaultModel) ??
+    null;
+  const resolvedDefault = normalizeModelId(modelStatus.resolvedDefault) ??
+    normalizeModelId(fallbackStatus?.resolvedDefault) ??
+    defaultModel;
+
+  return {
+    ...modelStatus,
+    defaultModel,
+    resolvedDefault
+  };
+}
+
+export function buildModelRecords(
+  models: ModelsPayload["models"],
+  agents: OpenClawAgent[],
+  modelStatus?: ModelsStatusPayload
+): ModelRecord[] {
+  const modelUsage = new Map<string, number>();
+
+  for (const agent of agents) {
+    const canonicalModelId = normalizeOpenAiModelId(agent.modelId);
+    modelUsage.set(canonicalModelId, (modelUsage.get(canonicalModelId) ?? 0) + 1);
+  }
+
+  const recordsByIdentity = new Map<string, ModelRecord>();
+
+  for (const model of models) {
+    const staleLegacyRoute = isUnsupportedLegacyModelId(model.key);
+    const provider = staleLegacyRoute
+      ? "unsupported"
+      : resolveModelRecordProvider(model.key, modelStatus, model);
+    const id = normalizeOpenAiModelId(model.key);
+    const record: ModelRecord = {
+      id,
+      name: model.name,
+      provider,
+      input: model.input,
+      contextWindow: model.contextWindow,
+      ...(model.contextWindows ? { contextWindows: model.contextWindows } : {}),
+      ...(model.contextWindowDefault ? { contextWindowDefault: model.contextWindowDefault } : {}),
+      local: model.local,
+      available: staleLegacyRoute ? false : resolveModelRecordAvailability(model, provider, modelStatus),
+      ...(model.unavailableReason ? { unavailableReason: model.unavailableReason } : {}),
+      ...(model.unavailableUntil !== undefined ? { unavailableUntil: model.unavailableUntil } : {}),
+      ...(model.reasoning !== undefined ? { reasoning: model.reasoning } : {}),
+      ...(model.thinkingLevels ? { thinkingLevels: model.thinkingLevels } : {}),
+      ...(model.thinkingDefault ? { thinkingDefault: model.thinkingDefault } : {}),
+      ...(model.supportsTools !== undefined ? { supportsTools: model.supportsTools } : {}),
+      ...(model.alias ? { alias: model.alias } : {}),
+      ...(model.apiKeySupported !== undefined ? { apiKeySupported: model.apiKeySupported } : {}),
+      ...(model.agentRuntime ? { agentRuntime: model.agentRuntime } : {}),
+      ...(model.deprecated !== undefined ? { deprecated: model.deprecated } : {}),
+      ...(model.disabled !== undefined ? { disabled: model.disabled } : {}),
+      missing: model.missing || staleLegacyRoute,
+      tags: staleLegacyRoute ? uniqueStrings([...model.tags, "stale-legacy-route"]) : model.tags,
+      usageCount: modelUsage.get(id) ?? 0
+    };
+    const identityKey = modelRecordIdentityKey(model.key, provider);
+    const existing = recordsByIdentity.get(identityKey);
+
+    recordsByIdentity.set(identityKey, existing ? mergeModelRecords(existing, record) : record);
+  }
+
+  return Array.from(recordsByIdentity.values());
+}
+
+function mergeModelRecords(existing: ModelRecord, candidate: ModelRecord): ModelRecord {
+  const preferred = scoreModelRecord(candidate) > scoreModelRecord(existing) ? candidate : existing;
+  const fallback = preferred === candidate ? existing : candidate;
+
+  return {
+    ...preferred,
+    contextWindow: preferred.contextWindow ?? fallback.contextWindow,
+    local: preferred.local ?? fallback.local,
+    available: preferred.available === true || fallback.available === true
+      ? true
+      : preferred.available ?? fallback.available,
+    missing: preferred.missing && fallback.missing,
+    tags: uniqueStrings([...preferred.tags, ...fallback.tags]),
+    usageCount: Math.max(preferred.usageCount, fallback.usageCount)
+  };
+}
+
+function scoreModelRecord(record: ModelRecord) {
+  let score = 0;
+
+  if (record.available === true) {
+    score += 100;
+  }
+
+  if (!record.missing) {
+    score += 50;
+  }
+
+  if (record.usageCount > 0) {
+    score += 5;
+  }
+
+  return score;
+}
+
+function resolveModelRecordAvailability(
+  model: ModelsPayload["models"][number],
+  provider: string,
+  modelStatus?: ModelsStatusPayload
+) {
+  if (model.available === false || model.missing || model.local === true || !modelStatus) {
+    return model.available;
+  }
+
+  const allowedModelIds = modelStatus.allowed ?? [];
+  if (allowedModelIds.length > 0 && !allowedModelIds.includes(normalizeOpenAiModelId(model.key))) {
+    return false;
+  }
+
+  const connection = isAddModelsProviderId(provider)
+    ? buildModelStatusConnectionStatus(provider, modelStatus, [normalizeOpenAiModelId(model.key)])
+    : null;
+  return connection ? (connection.connected ? model.available : false) : model.available;
+}
+
+function normalizeModelId(value: string | null | undefined) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readAgentModel(agent: AgentModelDefaultLike | undefined) {
+  return normalizeModelId(agent?.modelId) ?? normalizeModelId(agent?.model);
+}

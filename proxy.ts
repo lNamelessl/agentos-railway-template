@@ -1,0 +1,86 @@
+import { NextResponse, type NextRequest } from "next/server";
+
+import { evaluateAgentOsApiRequest, evaluateAuthenticatedAgentOsApiRequest } from "@/lib/security/api-auth";
+import { getInstanceProtectionStatus, readInstanceSessionCookie } from "@/lib/security/instance-protection";
+
+const publicInstanceApiPaths = new Set([
+  "/api/auth/status",
+  "/api/auth/login",
+  "/api/auth/lock",
+  "/api/auth/logout",
+  "/api/auth/unlock",
+  "/api/health",
+  "/api/accounts/browser-live/authorize",
+  "/api/internal/browser-policy/heartbeat",
+  "/api/internal/browser-policy/worker-event"
+]);
+const publicPwaShellPaths = new Set(["/site.webmanifest", "/sw.js"]);
+
+export async function proxy(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+  const isApiRequest = pathname.startsWith("/api/");
+
+  if (publicInstanceApiPaths.has(pathname) || publicPwaShellPaths.has(pathname) || pathname === "/login") {
+    return NextResponse.next();
+  }
+
+  let status;
+  try {
+    status = await getInstanceProtectionStatus(readInstanceSessionCookie(request.headers));
+  } catch {
+    if (isApiRequest) {
+      return NextResponse.json(
+        { error: "Instance Protection is unavailable. Run agentos auth reset on the host to recover.", code: "instance-auth-unavailable" },
+        { status: 503, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+    return new NextResponse("AgentOS Instance Protection is unavailable. Run agentos auth reset on the host to recover.", {
+      status: 503,
+      headers: { "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" }
+    });
+  }
+
+  if (status.protectionEnabled && !status.authenticated) {
+    if (isApiRequest) {
+      return NextResponse.json(
+        { error: "Unlock AgentOS to continue.", code: "instance-auth-required" },
+        { status: 401, headers: { "Cache-Control": "no-store", "X-AgentOS-Auth-Required": "instance" } }
+      );
+    }
+
+    const loginUrl = request.nextUrl.clone();
+    loginUrl.pathname = "/login";
+    loginUrl.search = "";
+    const returnTo = `${pathname}${request.nextUrl.search}`;
+    if (returnTo !== "/") loginUrl.searchParams.set("returnTo", returnTo);
+    return NextResponse.redirect(loginUrl);
+  }
+
+  if (!isApiRequest) return NextResponse.next();
+
+  const decision = status.protectionEnabled
+    ? evaluateAuthenticatedAgentOsApiRequest({
+        method: request.method,
+        url: request.url,
+        headers: request.headers
+      })
+    : evaluateAgentOsApiRequest({
+        method: request.method,
+        url: request.url,
+        headers: request.headers
+      });
+
+  if (decision.ok) return NextResponse.next();
+
+  return NextResponse.json(
+    {
+      error: decision.message,
+      code: decision.code
+    },
+    { status: decision.status }
+  );
+}
+
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:png|jpg|jpeg|gif|webp|svg|ico|mp4|webm|woff|woff2)$).*)"]
+};

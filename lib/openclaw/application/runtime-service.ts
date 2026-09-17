@@ -1,0 +1,301 @@
+import "server-only";
+
+import { getOpenClawAdapter } from "@/lib/openclaw/adapter/openclaw-adapter";
+import { ensureOpenAiAuthOrderForAgent } from "@/lib/openclaw/application/model-auth-service";
+import { stringifyCommandFailure } from "@/lib/openclaw/command-failure";
+import {
+  clearMissionControlRuntimeHistoryCache,
+  getMissionControlSnapshot,
+  invalidateMissionControlSnapshotCache
+} from "@/lib/openclaw/application/mission-control-service";
+import { buildTaskDetailFromDispatchRecord, buildTaskDetailFromTaskRecord } from "@/lib/openclaw/domains/task-detail";
+import { loadTaskHistoryForTask } from "@/lib/openclaw/domains/task-history";
+import { extractMissionCommandPayloads } from "@/lib/openclaw/domains/mission-dispatch-model";
+import { readMissionDispatchRecordById } from "@/lib/openclaw/domains/mission-dispatch-lifecycle";
+import {
+  getRuntimeOutputForResolvedRuntime as getRuntimeOutputForResolvedRuntimeFromTranscript
+} from "@/lib/openclaw/domains/runtime-transcript";
+import {
+  getRuntimeSmokeTestCacheEntry,
+  isRuntimeSmokeTestFresh,
+  mapRuntimeSmokeTestEntry,
+  persistRuntimeSmokeTest,
+  readMissionControlSettings
+} from "@/lib/openclaw/domains/control-plane-settings";
+import {
+  buildOpenAiAuthLoginCommand,
+  isOpenAiAuthFailure,
+  resolveOpenAiAuthRecoveryMessage
+} from "@/lib/openclaw/model-auth-errors";
+import { resolveOpenClawBin } from "@/lib/openclaw/cli";
+import { getOpenClawStateRootPath } from "@/lib/openclaw/state/paths";
+import { inspectOpenClawRuntimeState } from "@/lib/openclaw/state/runtime-state";
+import { resolveOpenClawModelReadinessIssue } from "@/lib/openclaw/readiness";
+import type {
+  MissionControlSnapshot,
+  OpenClawRuntimeSmokeTest,
+  RuntimeOutputRecord,
+  TaskDetailRecord,
+  TaskHistoryRecord
+} from "@/lib/openclaw/types";
+
+const runtimeSmokeTestMessage = "AgentOS runtime smoke test. Reply with a brief READY status.";
+
+function invalidateRuntimeSnapshotCache() {
+  invalidateMissionControlSnapshotCache();
+}
+
+export function clearRuntimeHistoryCache() {
+  clearMissionControlRuntimeHistoryCache();
+}
+
+function resolveRuntimeSmokeTestAgentId(
+  snapshot: MissionControlSnapshot,
+  preferredAgentId?: string | null
+) {
+  if (preferredAgentId && snapshot.agents.some((agent) => agent.id === preferredAgentId)) {
+    return preferredAgentId;
+  }
+
+  return snapshot.agents.find((agent) => agent.isDefault)?.id || snapshot.agents[0]?.id || null;
+}
+
+async function assertOpenClawRuntimeStateAccess(
+  agentId: string | null,
+  agentDir?: string | null
+) {
+  const runtimeState = await inspectOpenClawRuntimeState(getOpenClawStateRootPath(), agentId ? [agentId] : [], {
+    agentDirs: agentId
+      ? {
+          [agentId]: agentDir
+        }
+      : undefined,
+    touch: true
+  });
+
+  if (runtimeState.issues.length > 0) {
+    invalidateRuntimeSnapshotCache();
+    throw new Error(
+      `OpenClaw runtime state is not writable. AgentOS needs write access to ${runtimeState.stateRoot} and the agent session store before missions can run.`
+    );
+  }
+}
+
+export async function ensureOpenClawRuntimeStateAccess(options: {
+  agentId?: string | null;
+  agentDir?: string | null;
+} = {}) {
+  await assertOpenClawRuntimeStateAccess(options.agentId ?? null, options.agentDir);
+  invalidateRuntimeSnapshotCache();
+  return getMissionControlSnapshot({ force: true, includeHidden: true });
+}
+
+export async function touchOpenClawRuntimeStateAccess(options: {
+  agentId?: string | null;
+  agentDir?: string | null;
+} = {}) {
+  await assertOpenClawRuntimeStateAccess(options.agentId ?? null, options.agentDir);
+  invalidateRuntimeSnapshotCache();
+}
+
+export async function ensureOpenClawRuntimeSmokeTest(options: {
+  agentId?: string | null;
+  force?: boolean;
+} = {}): Promise<OpenClawRuntimeSmokeTest> {
+  const snapshot = await getMissionControlSnapshot({ force: true, includeHidden: true });
+  const agentId = resolveRuntimeSmokeTestAgentId(snapshot, options.agentId);
+  const smokeAgent = agentId ? snapshot.agents.find((agent) => agent.id === agentId) : null;
+  const modelReadinessError = resolveOpenClawModelReadinessIssue(
+    snapshot,
+    smokeAgent?.modelId === "unassigned" ? null : smokeAgent?.modelId
+  );
+
+  if (modelReadinessError) {
+    return {
+      status: "not-run",
+      checkedAt: new Date().toISOString(),
+      agentId,
+      runId: null,
+      summary: null,
+      error: `${modelReadinessError} AgentOS did not send a provider request.`
+    };
+  }
+
+  if (!agentId) {
+    return {
+      status: "not-run",
+      checkedAt: null,
+      agentId: null,
+      runId: null,
+      summary: null,
+      error: "AgentOS could not find an OpenClaw agent for the runtime smoke test."
+    };
+  }
+
+  const settings = await readMissionControlSettings();
+  const cached = getRuntimeSmokeTestCacheEntry(settings, agentId);
+
+  if (!options.force && isRuntimeSmokeTestFresh(cached)) {
+    return mapRuntimeSmokeTestEntry(agentId, cached);
+  }
+
+  await assertOpenClawRuntimeStateAccess(agentId, smokeAgent?.agentDir);
+
+  try {
+    await ensureOpenAiAuthOrderForAgent({
+      agentId,
+      modelId: smokeAgent?.modelId
+    });
+
+    const payload = await getOpenClawAdapter().runAgentTurn(
+      {
+        agentId,
+        message: runtimeSmokeTestMessage,
+        thinking: "off",
+        timeoutSeconds: 45
+      },
+      { timeoutMs: 50000 }
+    );
+    const result: OpenClawRuntimeSmokeTest = {
+      status: "passed",
+      checkedAt: new Date().toISOString(),
+      agentId,
+      runId: payload.runId ?? null,
+      summary:
+        payload.summary ||
+        extractMissionCommandPayloads(payload)[0]?.text ||
+        "AgentOS verified a real OpenClaw turn.",
+      error: null
+    };
+
+    await persistRuntimeSmokeTest(result);
+    invalidateRuntimeSnapshotCache();
+    return result;
+  } catch (error) {
+    const rawError = stringifyCommandFailure(error) || "OpenClaw runtime smoke test failed.";
+    const errorMessage = isOpenAiAuthFailure(rawError)
+      ? resolveOpenAiAuthRecoveryMessage(
+          buildOpenAiAuthLoginCommand(await resolveOpenClawBin().catch(() => "openclaw"))
+        )
+      : rawError;
+    const result: OpenClawRuntimeSmokeTest = {
+      status: "failed",
+      checkedAt: new Date().toISOString(),
+      agentId,
+      runId: null,
+      summary: null,
+      error: errorMessage
+    };
+
+    await persistRuntimeSmokeTest(result);
+    invalidateRuntimeSnapshotCache();
+    return result;
+  }
+}
+
+export async function getRuntimeOutput(runtimeId: string): Promise<RuntimeOutputRecord> {
+  let snapshot = await getMissionControlSnapshot({ includeHidden: true });
+  let runtime = snapshot.runtimes.find((entry) => entry.id === runtimeId);
+
+  if (!runtime) {
+    snapshot = await getMissionControlSnapshot({ force: true, includeHidden: true });
+    runtime = snapshot.runtimes.find((entry) => entry.id === runtimeId);
+  }
+
+  if (!runtime) {
+    return {
+      runtimeId,
+      status: "missing",
+      finalText: null,
+      finalTimestamp: null,
+      stopReason: null,
+      errorMessage: "Runtime was not found in the current OpenClaw snapshot.",
+      items: [],
+      createdFiles: [],
+      warnings: [],
+      warningSummary: null
+    };
+  }
+
+  return getRuntimeOutputForResolvedRuntimeFromTranscript(runtime, snapshot);
+}
+
+export async function getTaskDetail(
+  taskId: string,
+  options: {
+    dispatchId?: string | null;
+    taskHistoryCursor?: string | null;
+    taskHistoryLimit?: number;
+  } = {}
+): Promise<TaskDetailRecord> {
+  let snapshot = await getMissionControlSnapshot({ includeHidden: true });
+  let task = findTaskInSnapshot(snapshot, taskId);
+
+  if (!task && options.dispatchId) {
+    task = snapshot.tasks.find((entry) => entry.dispatchId === options.dispatchId);
+  }
+
+  if (!task) {
+    snapshot = await getMissionControlSnapshot({ force: true, includeHidden: true });
+    task = findTaskInSnapshot(snapshot, taskId);
+
+    if (!task && options.dispatchId) {
+      task = snapshot.tasks.find((entry) => entry.dispatchId === options.dispatchId);
+    }
+  }
+
+  if (!task) {
+    const dispatchId = typeof options.dispatchId === "string" ? options.dispatchId.trim() : "";
+
+    if (dispatchId) {
+      const dispatchRecord = await readMissionDispatchRecordById(dispatchId);
+
+      if (dispatchRecord) {
+        return buildTaskDetailFromDispatchRecord(dispatchRecord, snapshot);
+      }
+    }
+
+    throw new Error("Task was not found in the current OpenClaw snapshot.");
+  }
+
+  const dispatchRecord = task.dispatchId ? await readMissionDispatchRecordById(task.dispatchId) : null;
+  return buildTaskDetailFromTaskRecord(task, snapshot, dispatchRecord, options);
+}
+
+export async function getTaskHistory(
+  taskId: string,
+  options: { cursor?: string | null; limit?: number } = {}
+): Promise<TaskHistoryRecord | null> {
+  let snapshot = await getMissionControlSnapshot({ includeHidden: true });
+  let task = findTaskInSnapshot(snapshot, taskId);
+
+  if (!task) {
+    snapshot = await getMissionControlSnapshot({ force: true, includeHidden: true });
+    task = findTaskInSnapshot(snapshot, taskId);
+  }
+
+  if (!task) {
+    throw new Error("Task was not found in the current OpenClaw snapshot.");
+  }
+
+  const runs = snapshot.runtimes.filter((runtime) => task.runtimeIds.includes(runtime.id));
+  const result = await loadTaskHistoryForTask({
+    task,
+    runs,
+    snapshot,
+    cursor: options.cursor,
+    limit: options.limit
+  });
+  return result?.record ?? null;
+}
+
+function findTaskInSnapshot(snapshot: MissionControlSnapshot, taskId: string) {
+  return snapshot.tasks.find((entry) => {
+    if (entry.id === taskId) return true;
+
+    const openClawTaskId = entry.metadata.openClawTaskId;
+    if (typeof openClawTaskId === "string" && openClawTaskId.trim() === taskId) return true;
+
+    return entry.metadata.sourceOfTruth === "openclaw-tasks.list" && entry.metadata.taskId === taskId;
+  });
+}

@@ -1,0 +1,86 @@
+import { edgeTypes, nodeTypes } from "@/components/mission-control/canvas.registry";
+import {
+  arePersistedNodePositionsEqual,
+  emptyPersistedNodePositions,
+  extractPersistedNodePositions,
+  getNodePositionsStorageKey,
+  parsePersistedNodePositions,
+  parseWorkspaceTaskCardFilters,
+  readPersistedNodePositions,
+  readWorkspaceTaskCardFilters,
+  readFromLocalStorage,
+  resolveNodePersistedPositionKey,
+  resolvePersistedPosition,
+  toLegacyPersistedAgentPositionKey,
+  toLegacyPersistedTaskPositionKey,
+  toPersistedAgentPositionKey,
+  toPersistedTaskPositionKey,
+  writeToLocalStorage,
+  writeWorkspaceTaskCardFilters,
+  workspaceTaskCardFiltersStorageKey
+} from "@/components/mission-control/canvas.persistence";
+import {
+  mergeSurfaceModulePositions,
+  resolveSurfaceActionAnchorPosition,
+  resolveSurfaceModuleAnchorPosition,
+  stepSurfaceModuleSpring,
+  toAccountTetherNodeId,
+  toSurfaceActionNodeId,
+  toSurfaceTetherNodeId
+} from "@/components/mission-control/canvas.motion";
+import {
+  markTaskAsJustCreated,
+  mergeNodePositions,
+  resolveNodeZIndex
+} from "@/components/mission-control/canvas.layout";
+export type {
+  CanvasEdge,
+  CanvasNode,
+  PersistedNodePosition,
+  PersistedNodePositionMap,
+  SpringVelocity,
+  FocusTaskAnchor
+} from "@/components/mission-control/canvas-types";
+export {
+  buildAgentSurfaceBadges,
+  buildCanvasGraph,
+  buildEdgesForNodes,
+  buildSurfaceTetherEdges,
+  isLiveTask,
+  isTaskHidden,
+  resolveTaskOwnerId,
+  resolveTaskWorkspaceId
+} from "@/components/mission-control/canvas.graph";
+
+export {
+  edgeTypes,
+  nodeTypes,
+  emptyPersistedNodePositions,
+  arePersistedNodePositionsEqual,
+  extractPersistedNodePositions,
+  getNodePositionsStorageKey,
+  parsePersistedNodePositions,
+  parseWorkspaceTaskCardFilters,
+  readPersistedNodePositions,
+  readWorkspaceTaskCardFilters,
+  readFromLocalStorage,
+  markTaskAsJustCreated,
+  mergeSurfaceModulePositions,
+  mergeNodePositions,
+  resolveNodePersistedPositionKey,
+  resolvePersistedPosition,
+  resolveNodeZIndex,
+  resolveSurfaceActionAnchorPosition,
+  resolveSurfaceModuleAnchorPosition,
+  stepSurfaceModuleSpring,
+  toAccountTetherNodeId,
+  toLegacyPersistedAgentPositionKey,
+  toLegacyPersistedTaskPositionKey,
+  toPersistedAgentPositionKey,
+  toPersistedTaskPositionKey,
+  toSurfaceActionNodeId,
+  toSurfaceTetherNodeId,
+  writeToLocalStorage,
+  writeWorkspaceTaskCardFilters,
+  workspaceTaskCardFiltersStorageKey
+};

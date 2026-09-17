@@ -1,0 +1,125 @@
+import "server-only";
+
+import {
+  clearMissionControlCaches,
+  getMissionControlSnapshot as getOpenClawMissionControlSnapshot
+} from "@/lib/openclaw/application/mission-control-service";
+import { createAgent, deleteAgent, updateAgent } from "@/lib/openclaw/application/agent-service";
+import {
+  createWorkspaceProject,
+  deleteWorkspaceProject,
+  readWorkspaceEditSeed,
+  updateWorkspaceProject
+} from "@/lib/openclaw/application/workspace-service";
+import { abortMissionTask, submitMission } from "@/lib/openclaw/application/mission-service";
+import { controlRunningTaskSession } from "@/lib/openclaw/application/task-control-service";
+import { runTaskHealthAudit } from "@/lib/openclaw/application/task-health-service";
+import {
+  ensureOpenClawRuntimeSmokeTest,
+  ensureOpenClawRuntimeStateAccess,
+  getRuntimeOutput,
+  getTaskDetail,
+  touchOpenClawRuntimeStateAccess
+} from "@/lib/openclaw/application/runtime-service";
+import {
+  approveRuntimeIssue,
+  dismissRuntimeIssue,
+  inspectRuntimeIssueDevices,
+  repairRuntimeIssueLegacyState
+} from "@/lib/openclaw/application/runtime-issue-service";
+import {
+  generateGatewayNativeAuthToken,
+  getCrossAgentMessageSettings,
+  getGatewayBindMode,
+  getGatewayNativeAuthStatus,
+  repairGatewayNativeDeviceAccess,
+  saveGatewayNativeAuthCredential,
+  updateCrossAgentMessageSettings,
+  updateGatewayRemoteUrl,
+  updateWorkspaceRoot
+} from "@/lib/openclaw/application/settings-service";
+import { reconcileAgentOsSessionSecurityDefaults } from "@/lib/openclaw/domains/session-security-policy";
+import {
+  createManagedSurfaceAccount,
+  createTelegramChannelAccount,
+  deleteWorkspaceChannelEverywhere,
+  disconnectWorkspaceChannel,
+  discoverDiscordRoutes,
+  discoverSurfaceRoutes,
+  discoverTelegramGroups,
+  getChannelRegistry,
+  reconcileWorkspaceSurfaceBindings,
+  upsertWorkspaceChannel
+} from "@/lib/openclaw/application/channel-service";
+import {
+  ensureWorkspaceNativeKnowledge,
+  getWorkspaceNativeKnowledgeStatus,
+  planWorkspaceKnowledgeBinding
+} from "@/lib/agentos/application/workspace-native-knowledge-service";
+import {
+  getWorkspaceChannelSetupStatus,
+  performWorkspaceChannelSetup
+} from "@/lib/openclaw/application/workspace-channel-setup-service";
+
+import { normalizeControlPlaneSnapshot } from "@/lib/agentos/acl/openclaw";
+import type { ControlPlaneSnapshot } from "@/lib/agentos/contracts";
+
+export async function getControlPlaneSnapshot(
+  options: { force?: boolean; includeHidden?: boolean; loadProfile?: "interactive" | "refresh" | "system" } = {}
+): Promise<ControlPlaneSnapshot> {
+  const snapshot = await getOpenClawMissionControlSnapshot(options);
+  return normalizeControlPlaneSnapshot(snapshot);
+}
+
+export const getMissionControlSnapshot = getControlPlaneSnapshot;
+
+export {
+  abortMissionTask,
+  approveRuntimeIssue,
+  clearMissionControlCaches,
+  controlRunningTaskSession,
+  createAgent,
+  createManagedSurfaceAccount,
+  createTelegramChannelAccount,
+  createWorkspaceProject,
+  deleteAgent,
+  deleteWorkspaceChannelEverywhere,
+  deleteWorkspaceProject,
+  disconnectWorkspaceChannel,
+  dismissRuntimeIssue,
+  discoverDiscordRoutes,
+  discoverSurfaceRoutes,
+  discoverTelegramGroups,
+  ensureWorkspaceNativeKnowledge,
+  ensureOpenClawRuntimeSmokeTest,
+  ensureOpenClawRuntimeStateAccess,
+  generateGatewayNativeAuthToken,
+  getCrossAgentMessageSettings,
+  getChannelRegistry,
+  getGatewayBindMode,
+  getGatewayNativeAuthStatus,
+  getRuntimeOutput,
+  getWorkspaceNativeKnowledgeStatus,
+  getWorkspaceChannelSetupStatus,
+  getTaskDetail,
+  inspectRuntimeIssueDevices,
+  readWorkspaceEditSeed,
+  reconcileWorkspaceSurfaceBindings,
+  planWorkspaceKnowledgeBinding,
+  performWorkspaceChannelSetup,
+  repairRuntimeIssueLegacyState,
+  repairGatewayNativeDeviceAccess,
+  saveGatewayNativeAuthCredential,
+  runTaskHealthAudit,
+  submitMission,
+  updateAgent,
+  updateCrossAgentMessageSettings,
+  reconcileAgentOsSessionSecurityDefaults,
+  updateGatewayRemoteUrl,
+  updateWorkspaceProject,
+  updateWorkspaceRoot,
+  touchOpenClawRuntimeStateAccess,
+  upsertWorkspaceChannel
+};
+
+export type { ControlPlaneSnapshot } from "@/lib/agentos/contracts";

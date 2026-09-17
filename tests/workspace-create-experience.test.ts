@@ -1,0 +1,505 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+
+import {
+  formatWorkspaceChannelSetup,
+  presentWorkspaceBlueprint,
+  presentWorkspaceReviewRecovery
+} from "@/lib/agentos/ui/workspace-create-presenter";
+import { friendlyCreationPhase, friendlyProvisioningPhase, presentWorkspaceCreationExperience } from "@/lib/agentos/ui/workspace-creation-experience-presenter";
+import { createInitialWorkspaceCreationSnapshot } from "@/lib/agentos/domains/workspace-creation-run";
+import { presentWorkspaceCreationDiscovery } from "@/lib/agentos/domains/workspace-creation-discovery";
+import type { WorkspaceArchitectResult } from "@/lib/agentos/domains/workspace-blueprint";
+
+const componentPath = "components/mission-control/workspace-create/create-workspace-experience.tsx";
+
+function minimalResult(overrides: Partial<WorkspaceArchitectResult["reasoning"]> = {}): WorkspaceArchitectResult {
+  return {
+    blueprint: {
+      schemaVersion: 1,
+      status: "ready",
+      id: "blueprint-test",
+      createdAt: "2026-09-10T00:00:00.000Z",
+      updatedAt: "2026-09-10T00:00:00.000Z",
+      identity: { name: "Acme", purpose: "Operate Acme", projectType: "general" },
+      brief: "Build an Acme workspace.",
+      operatorConstraints: [],
+      materialization: { mode: "empty" },
+      knowledge: {
+        sources: [],
+        generationId: null,
+        sourceIds: [],
+        coverage: { sourceCount: 0, readySourceCount: 0, documentCount: 0 },
+        retrieval: { mode: "none", queries: [], evidenceRefs: [] }
+      },
+      workforce: {
+        primaryAgent: {
+          id: "acme-operator",
+          role: "Operator",
+          name: "Acme Operator",
+          enabled: true,
+          persistence: "primary",
+          isPrimary: true,
+          purpose: "Operate the workspace.",
+          responsibilities: [],
+          outputs: [],
+          skillIds: [],
+          toolIds: [],
+          policy: { preset: "worker", missingToolBehavior: "fallback", installScope: "none", fileAccess: "workspace-only", networkAccess: "restricted" },
+          justification: "Primary operator.",
+          evidenceRefs: []
+        },
+        specialists: [],
+        allowEphemeralSubagents: true,
+        maxParallelRuns: 2
+      },
+      capabilities: { skills: [], tools: [] },
+      memory: { ownership: "openclaw-native", search: "native-gateway-preferred", seedRequired: false, durableFacts: [], rationale: "OpenClaw owns memory." },
+      connections: [],
+      operations: { workflows: [], automations: [], channels: [] },
+      safety: { workspaceOnly: true, generationSideEffectFree: true, importedKnowledgeUntrusted: true, notes: [] },
+      recommendations: [],
+      assumptions: [],
+      warnings: [],
+      evidence: [],
+      operatorOverrides: { lockedPaths: [], lockedDecisions: [] },
+      provenance: {
+        architectRunId: "run-test",
+        inputFingerprint: "a".repeat(64),
+        knowledgeGenerationId: null,
+        sourceIds: [],
+        createdAt: "2026-09-10T00:00:00.000Z",
+        modelId: "test/architect",
+        runtime: "bounded-local",
+        reasoningMode: "model-runtime",
+        failureKind: "none",
+        policyVersion: "phase6-intelligence-aware-architect-v1"
+      }
+    },
+    summary: "Acme workspace",
+    assumptions: [],
+    warnings: [],
+    recommendations: [],
+    validation: { valid: true, issues: [] },
+    freshness: {
+      status: "unknown",
+      blueprintGenerationId: null,
+      currentGenerationId: null,
+      reason: "Unknown"
+    },
+    reasoning: {
+      status: "model",
+      mode: "model-runtime",
+      attempts: 1,
+      modelId: "test/architect",
+      warning: null,
+      failureKind: "none",
+      ...overrides
+    }
+  };
+}
+
+test("blueprint presenter keeps minimum topology compact and preserves fallback state", () => {
+  const model = presentWorkspaceBlueprint(minimalResult({ status: "fallback", mode: "deterministic-safe-fallback", failureKind: "gateway" }));
+
+  assert.equal(model.primaryAgent.name, "Acme Operator");
+  assert.deepEqual(model.specialists, []);
+  assert.deepEqual(model.automations, []);
+  assert.deepEqual(model.channels, []);
+  assert.equal(model.fallback, true);
+
+  const quickModel = presentWorkspaceBlueprint(minimalResult({ status: "fallback", mode: "deterministic-safe-fallback", failureKind: "gateway" }), { profile: "quick" });
+  assert.doesNotMatch(quickModel.attention.join("\n"), /AI architecture was unavailable/);
+});
+
+test("blueprint presenter preserves structured partial-context and fallback diagnostics", () => {
+  const model = presentWorkspaceBlueprint(minimalResult({ status: "fallback", mode: "deterministic-safe-fallback", failureKind: "timeout", failureCode: "architect-timeout", retryability: "transient" }), {
+    partialContext: true,
+    attempts: 2,
+    elapsedMs: 12_000,
+    retryAvailable: true,
+    failureCategory: "architect-timeout"
+  });
+  assert.equal(model.partialContext, true);
+  assert.equal(model.contextWarning, "Architecture generated from partial project context.");
+  assert.equal(model.attempts, 2);
+  assert.equal(model.elapsedMs, 12_000);
+  assert.equal(model.retryAvailable, true);
+  assert.equal(model.failureCategory, "architect-timeout");
+});
+
+test("blueprint presenter carries structured extraction coverage into review", () => {
+  const model = presentWorkspaceBlueprint(minimalResult(), {
+    extraction: {
+      status: "partial",
+      extractionId: "intelligence-extraction-test",
+      generationId: "knowledge-generation-test",
+      evidenceCount: 4,
+      factCount: 3,
+      resourceCount: 2,
+      verifiedFactCount: 1,
+      verifiedResourceCount: 1,
+      conflictCount: 1,
+      warningCount: 1,
+      unknownCount: 2
+    }
+  });
+  assert.equal(model.extraction?.status, "partial");
+  assert.equal(model.extraction?.verifiedFactCount, 1);
+});
+
+test("channel setup copy distinguishes WhatsApp QR sessions from token channels", () => {
+  assert.equal(formatWorkspaceChannelSetup({ authenticationKind: "qr-session", requiresCredentials: false, requiresAuthentication: true }), "Setup required · QR sign-in");
+  assert.equal(formatWorkspaceChannelSetup({ authenticationKind: "token", requiresCredentials: true, requiresAuthentication: true }), "Setup required · Token");
+  assert.equal(formatWorkspaceChannelSetup({ authenticationKind: "none", requiresCredentials: false, requiresAuthentication: false }), "Ready to use");
+});
+
+test("creation experience presenter uses friendly stages and preserves structured attention", () => {
+  const run = {
+    runId: "run-presenter",
+    input: { profile: "high", sources: [] },
+    snapshot: {
+      ...createInitialWorkspaceCreationSnapshot(1),
+      state: "review-ready" as const,
+      stage: "review-preparation" as const,
+      context: { ...createInitialWorkspaceCreationSnapshot(1).context, status: "partial" as const },
+      architect: { ...createInitialWorkspaceCreationSnapshot(1).architect, partialContext: true },
+      composition: { ...createInitialWorkspaceCreationSnapshot(1).composition!, status: "fallback" as const, artifactCount: 2, inputFingerprint: "a".repeat(64) }
+    }
+  } as never;
+  const model = presentWorkspaceCreationExperience({ run, result: minimalResult(), sources: [] });
+  assert.equal(model.stage, "review");
+  assert.equal(model.phaseLabel, "Review your workspace");
+  assert.match(model.attentionItems.join("\n"), /partial project context/);
+  assert.match(model.attentionItems.join("\n"), /deterministic safe fallback/);
+  assert.equal(model.currentActivity, "Reading project context");
+  assert.equal(model.coverage.status, "partial");
+  assert.deepEqual(model.metrics, { pagesRead: 0, documentsRead: 0, factsFound: 0, officialResources: 0 });
+  assert.equal(friendlyCreationPhase("workspace-composition"), "Preparing workspace");
+  assert.equal(friendlyProvisioningPhase("applying-composition"), "Preparing workspace");
+});
+
+test("creation experience presents native preparation progress and degraded state honestly", () => {
+  const run = { runId: "run-native-preparation", input: { profile: "fast", sources: [] }, snapshot: createInitialWorkspaceCreationSnapshot(1) } as never;
+  const inProgress = presentWorkspaceCreationExperience({
+    run,
+    result: minimalResult(),
+    provisioningRun: {
+      state: "preparing-environment",
+      environmentPreparation: { requested: true, status: "in-progress", error: null, cost: { detail: "OpenClaw owns provider economics." } }
+    }
+  });
+  assert.equal(inProgress.stage, "provisioning");
+  assert.equal(inProgress.phaseLabel, "Preparing native environment");
+  assert.equal(inProgress.activities.find((activity) => activity.id === "environment")?.status, "active");
+  assert.match(inProgress.attentionItems.join("\n"), /still in progress/);
+
+  const unsupported = presentWorkspaceCreationExperience({
+    run,
+    result: minimalResult(),
+    provisioningRun: {
+      state: "partial",
+      environmentPreparation: { requested: true, status: "unsupported", error: { message: "Native preparation unavailable." } }
+    }
+  });
+  assert.equal(unsupported.activities.find((activity) => activity.id === "environment")?.status, "attention");
+  assert.match(unsupported.attentionItems.join("\n"), /Native preparation unavailable/);
+});
+
+test("native preparation remains opt-in in the workspace creation surface", async () => {
+  const source = await readFile(componentPath, "utf8");
+  assert.match(source, /Prepare a native OpenClaw environment/);
+  assert.match(source, /fetch\("\/api\/openclaw\/execution-topology"/);
+  assert.match(source, /Select an authorized native profile/);
+  assert.match(source, /profileId: environmentPreparation\.profileId/);
+  assert.doesNotMatch(source, /placeholder="Enter a profile ID from OpenClaw"/);
+  assert.match(source, /Preparation stays disabled/);
+  assert.match(source, /Access to the native OpenClaw profile inventory was denied/);
+  assert.match(source, /The selected native profile will be passed to OpenClaw unchanged/);
+  assert.match(source, /Retry preparation/);
+  assert.match(source, /The preparation key is retained in the durable provisioning record/);
+});
+
+test("final review metrics use durable Project Intelligence rather than extraction candidates", () => {
+  const snapshot = createInitialWorkspaceCreationSnapshot(1);
+  snapshot.extraction = { ...snapshot.extraction, factCount: 15, resourceCount: 79 };
+  snapshot.intelligence = {
+    ...snapshot.intelligence,
+    review: {
+      projectName: "CoinCollect",
+      description: "A fictional project.",
+      projectType: "software",
+      understanding: [],
+      facts: Array.from({ length: 15 }, (_, index) => ({ id: `fact-${index}`, key: "projectName", statement: "The project has a name.", verification: "verified" as const, conflicted: false })),
+      resources: Array.from({ length: 8 }, (_, index) => ({ id: `resource-${index}`, label: `Resource ${index}`, category: "documentation", locator: `https://example.test/${index}`, verification: "discovered" as const, conflicted: false, origin: "first-party-documentation" })),
+      conflicts: [],
+      unknowns: [],
+      sourceCount: 1,
+      evidenceCount: 15
+    }
+  };
+  const run = { runId: "run-durable-metrics", snapshot, events: [] } as never;
+  const model = presentWorkspaceCreationExperience({ run, result: minimalResult(), sources: [] });
+  assert.deepEqual(model.metrics, { pagesRead: 0, documentsRead: 0, factsFound: 15, officialResources: 8 });
+});
+
+test("live creation discovery is derived from bounded events and keeps aggregate metrics current", () => {
+  const snapshot = createInitialWorkspaceCreationSnapshot(1);
+  snapshot.context.sourceProgress = [{ sourceId: "website", sourceKind: "website", state: "ready", discoveredItems: 4, fetchedItems: 3, storedDocuments: 2, warningCount: 0, currentActivity: "Source read", currentLocator: "https://acme.example/docs" }];
+  snapshot.extraction = { ...snapshot.extraction, factCount: 2, resourceCount: 3, conflictCount: 1 };
+  const run = {
+    runId: "run-signals",
+    snapshot,
+    oldestRetainedSequence: 1,
+    events: [
+      { sequence: 1, activityCode: "page-fetch-started", sourceId: "website", activityData: { currentLocator: "https://acme.example/" } },
+      { sequence: 2, activityCode: "page-fetched", sourceId: "website", activityData: { currentLocator: "https://acme.example/" } },
+      { sequence: 3, activityCode: "fact-extracted", sourceId: "website", activityData: { currentActivity: "The project publishes a public name." } },
+      { sequence: 4, activityCode: "conflict-detected", sourceId: "website", activityData: { currentActivity: "Project name conflict" } }
+    ]
+  } as never;
+  const model = presentWorkspaceCreationDiscovery(run);
+  assert.equal(model.aggregate.pages, 3);
+  assert.equal(model.aggregate.documents, 2);
+  assert.equal(model.aggregate.facts, 2);
+  assert.equal(model.aggregate.resources, 3);
+  assert.equal(model.aggregate.conflicts, 1);
+  assert.equal(model.signals.filter((signal) => signal.kind === "page").length, 1);
+  assert.ok(model.signals.some((signal) => signal.state === "attention"));
+});
+
+test("live creation discovery surfaces normalized snapshot findings when event history has no signal entries", () => {
+  const snapshot = createInitialWorkspaceCreationSnapshot(1);
+  snapshot.extraction = { ...snapshot.extraction, factCount: 15, resourceCount: 79, conflictCount: 1 };
+  snapshot.intelligence = {
+    ...snapshot.intelligence,
+    review: {
+      projectName: "CoinCollect",
+      description: "A fictional collection workspace.",
+      projectType: "software",
+      understanding: [],
+      facts: [{ id: "fact-1", key: "projectName", statement: "The project is named CoinCollect.", verification: "verified", conflicted: false }],
+      resources: [{ id: "resource-1", label: "Developer docs", category: "documentation", locator: "https://coincollect.example/docs", verification: "discovered", conflicted: false, origin: "authoritative-connected-source" }],
+      conflicts: [{ id: "conflict-1", summary: "A stale resource names an older project.", status: "open", subjectCount: 2 }],
+      unknowns: [],
+      sourceCount: 1,
+      evidenceCount: 3
+    }
+  };
+  const run = { runId: "run-snapshot-findings", snapshot, events: [] } as never;
+
+  const model = presentWorkspaceCreationDiscovery(run);
+  assert.deepEqual(model.signals.slice(0, 3).map((signal) => signal.label), [
+    "The project is named CoinCollect.",
+    "Developer docs · documentation",
+    "Conflict · A stale resource names an older project."
+  ]);
+  assert.equal(model.signals[0]?.state, "verified");
+  assert.equal(model.signals[1]?.state, "found");
+  assert.equal(model.signals[2]?.state, "attention");
+  assert.ok(model.signals.some((signal) => /more canonical claims found/.test(signal.label)));
+  assert.ok(model.signals.some((signal) => /more project resources found/.test(signal.label)));
+});
+
+test("review presenter exposes only bounded intelligence and composition projections", () => {
+  const result = minimalResult();
+  const review = presentWorkspaceBlueprint(result, {
+    intelligence: {
+      ...createInitialWorkspaceCreationSnapshot(1).intelligence,
+      status: "model",
+      review: {
+        projectName: "Acme",
+        description: "A useful project.",
+        projectType: "software",
+        understanding: ["A useful project."],
+        facts: [{ id: "fact-1", key: "projectName", statement: "The project is named Acme.", verification: "verified", conflicted: false }],
+        resources: [{ id: "resource-1", label: "Documentation", category: "documentation", locator: "https://acme.example/docs", verification: "discovered", conflicted: false, origin: "first-party-documentation" }],
+        conflicts: [{ id: "conflict-1", summary: "Two names were found.", status: "open", subjectCount: 2 }],
+        unknowns: [],
+        sourceCount: 1,
+        evidenceCount: 2
+      }
+    }
+  });
+  assert.equal(review.projectIntelligence?.projectName, "Acme");
+  assert.equal(review.projectIntelligence?.facts[0]?.verification, "verified");
+  assert.equal(review.projectIntelligence?.conflicts[0]?.status, "open");
+  assert.equal(review.project.name, "Acme");
+  assert.equal(review.project.keyFacts[0]?.key, "projectName");
+  assert.deepEqual(review.project.understanding, ["A useful project."]);
+  assert.equal(review.sourceSummary.evidenceCount, 2);
+  assert.equal(review.coverage.status, "full");
+  assert.equal(review.technicalDetails.intelligenceStatus, "model");
+});
+
+test("project highlight identity keys remain unique when canonical claims repeat", () => {
+  const review = presentWorkspaceBlueprint(minimalResult(), {
+    intelligence: {
+      ...createInitialWorkspaceCreationSnapshot(1).intelligence,
+      status: "model",
+      review: {
+        projectName: "CoinCollect",
+        description: "A fictional project.",
+        projectType: "software",
+        understanding: [],
+        facts: [
+          { id: "contract-fact-1", key: "contractAddress", statement: "The project publishes a public contract address.", verification: "discovered", conflicted: false },
+          { id: "contract-fact-2", key: "contractAddress", statement: "The project publishes a public contract address.", verification: "discovered", conflicted: false }
+        ],
+        resources: [],
+        conflicts: [],
+        unknowns: [],
+        sourceCount: 1,
+        evidenceCount: 2
+      }
+    }
+  });
+
+  const ids = review.project.highlights.map((highlight) => highlight.id);
+  assert.deepEqual(ids, ["contract-fact-1", "contract-fact-2"]);
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test("workspace review recovery maps observed failures to one meaningful action", () => {
+  const modelSetup = presentWorkspaceReviewRecovery({
+    readiness: { status: "ready", provisionable: true, reasonCode: "ready", requiredAction: "none", message: "Ready.", checkedAt: "2026-09-14T00:00:00.000Z", blueprintFingerprint: null, planId: null, planFingerprint: null },
+    provisioningRun: { state: "failed", error: { code: "model-not-ready", message: "OpenClaw model setup is incomplete." } }
+  });
+  assert.equal(modelSetup.action, "open-model-setup");
+  assert.equal(modelSetup.actionLabel, "Open model setup");
+
+  const agentSync = presentWorkspaceReviewRecovery({
+    readiness: { status: "ready", provisionable: true, reasonCode: "ready", requiredAction: "none", message: "Ready.", checkedAt: "2026-09-14T00:00:00.000Z", blueprintFingerprint: null, planId: null, planFingerprint: null },
+    provisioningRun: { state: "failed", error: { code: "agent-provisioning", message: "Required workspace agent was not verified." } }
+  });
+  assert.equal(agentSync.action, "retry-provisioning");
+  assert.equal(agentSync.actionLabel, "Refresh OpenClaw and retry");
+  assert.match(agentSync.description, /existing provisioning run/);
+});
+
+test("create mode is Blueprint-first and does not enter the legacy Planner", async () => {
+  const [wrapperSource, source, contextRoute, activitySource, intelligenceIndicatorSource, layoutSource, shellSource, operationsShellSource] = await Promise.all([
+    readFile("components/mission-control/workspace-wizard/workspace-wizard-dialog.tsx", "utf8"),
+    readFile(componentPath, "utf8"),
+    readFile("app/api/workspaces/context/route.ts", "utf8"),
+    readFile("components/workspace-creation-activity-indicator.tsx", "utf8"),
+    readFile("components/mission-control/workspace-intelligence-status-indicator.tsx", "utf8"),
+    readFile("app/layout.tsx", "utf8"),
+    readFile("components/mission-control/mission-control-shell.tsx", "utf8"),
+    readFile("components/operations/operations-shell.tsx", "utf8")
+  ]);
+
+  assert.match(wrapperSource, /if \(!props\.workspaceEditId\)/);
+  assert.match(wrapperSource, /<CreateWorkspaceExperience/);
+  assert.match(source, /fetch\("\/api\/workspaces\/creation-runs"/);
+  assert.match(source, /function buildUrlSource\(draft: SourceDraft\)/);
+  assert.match(source, /const pendingSourceResult = sourceDraft\.value\.trim\(\) \? buildUrlSource\(sourceDraft\) : null/);
+  assert.match(source, /const nextSources = pendingSource \? \[\.\.\.sources, pendingSource\] : sources/);
+  assert.match(source, /formData\.set\("sources", JSON\.stringify\(nextSources\)\)/);
+  assert.match(source, /pollCreationRun\(initial\.runId, controller, initial, nextSources\)/);
+  assert.match(source, /Why this agent/);
+  assert.match(source, /Sources analyzed/);
+  assert.match(source, /Trigger:/);
+  assert.match(source, /Outputs:/);
+  assert.match(source, /Skills/);
+  assert.match(source, /Tools/);
+  assert.match(source, /fetch\(`\/api\/workspaces\/creation-runs\/\$\{runId\}\?afterSequence=/);
+  assert.match(source, /fetch\(`\/api\/workspaces\/creation-runs\/\$\{runId\}\/cancel`/);
+  assert.match(source, /fetch\(`\/api\/workspaces\/creation-runs\/\$\{creationRun\.runId\}\/revise`/);
+  assert.match(source, /WORKSPACE_KNOWLEDGE_FILE_ACCEPT/);
+  assert.match(source, /Project context/);
+  assert.match(source, /Included from your project/);
+  assert.match(source, /workspace-architect-chip-enter/);
+  assert.match(source, /import \{ PikoLoader \} from "@\/components\/ui\/piko-loader"/);
+  assert.match(source, /<PikoLoader/);
+  assert.match(source, /CreationProgressView/);
+  assert.match(source, /WorkspaceReadyView/);
+  assert.match(source, /What came online/);
+  assert.match(source, /Finish setup when ready/);
+  assert.match(source, /Background learning is on/);
+  assert.match(source, /Minimize workspace creation/);
+  assert.match(activitySource, /Reopen workspace creation/);
+  assert.match(activitySource, /creation-runs\/\$\{encodeURIComponent\(minimizedRunId\)\}/);
+  assert.match(activitySource, /workspaceCreationReopen/);
+  assert.match(activitySource, /requestWorkspaceCreationReopen/);
+  assert.match(activitySource, /clearWorkspaceCreationMinimizedRun/);
+  assert.match(activitySource, /bottom-\[calc\(max\(1rem,env\(safe-area-inset-bottom\)\)\+3\.5rem\)\]/);
+  assert.match(intelligenceIndicatorSource, /fixed inset-x-0 bottom-\[max\(1rem,env\(safe-area-inset-bottom\)\)\]/);
+  assert.doesNotMatch(intelligenceIndicatorSource, /fixed right-4 top-4/);
+  assert.match(layoutSource, /WorkspaceCreationActivityIndicator/);
+  assert.match(shellSource, /workspaceCreationReopen/);
+  assert.match(shellSource, /workspaceCreationReopenEvent/);
+  assert.match(shellSource, /event\.preventDefault\(\)/);
+  assert.match(shellSource, /creationReopenRequest/);
+  assert.match(operationsShellSource, /WorkspaceIntelligenceStatusIndicator/);
+  assert.match(operationsShellSource, /creationReviewRunId=\{workspaceCreationReviewRunId\}/);
+  assert.match(source, /reopenRequest/);
+  assert.match(source, /persistWorkspaceCreationMinimizedRun/);
+  assert.match(source, /readWorkspaceCreationMinimizedRunId/);
+  assert.match(source, /onOutsideInteraction/);
+  assert.match(source, /fetch\("\/api\/workspaces\/provision"/);
+  assert.doesNotMatch(source, /workspace-progress-shimmer/);
+  assert.match(source, /isProvisioningStarting/);
+  assert.match(source, /provisioningStarting/);
+  assert.doesNotMatch(source, /66 \+ Math\.round/);
+  assert.match(source, /Setting up your workspace…/);
+  assert.match(source, /Working for/);
+  assert.match(source, /Workspace creation progress/);
+  assert.doesNotMatch(source, /Live provisioning signals/);
+  assert.match(source, /Open Workspace/);
+  assert.match(source, /Close workspace ready screen/);
+  assert.match(source, /onClick=\{\(\) => handleDialogOpenChange\(false\)\}/);
+  assert.match(source, /if \(!nextOpen && \(provisioningRun\?\.state === "ready" \|\| provisioningRun\?\.state === "partial"\)\)/);
+  assert.match(source, /const recoverProvisioningRun = async/);
+  assert.match(source, /const recoveredProvisioning = await recoverProvisioningRun\(activeRun\)/);
+  assert.match(source, />Minimize</);
+  assert.match(source, /canProvisionBlueprint/);
+  assert.doesNotMatch(source, /setProgressPhase/);
+  assert.doesNotMatch(source, /activeStage === "review-preparation"/);
+  assert.match(source, /Architecture generated from partial project context/);
+  assert.match(source, /Start over/);
+  assert.match(source, /const \[isStartingOver, setIsStartingOver\]/);
+  assert.match(source, /if \(!creationRun\) \{\s*resetCreationState\(\);\s*return;/);
+  assert.match(source, /creation-runs\/\$\{creationRun\.runId\}\/abandon/);
+  assert.match(source, /startOverError/);
+  assert.match(source, /View project evidence/);
+  assert.match(source, /View workspace plan/);
+  assert.match(source, /ReviewStatusCard/);
+  assert.match(source, /onOpenModelSetup/);
+  assert.doesNotMatch(source, /Project highlights/);
+  assert.doesNotMatch(source, /Workspace provisioning needs attention/);
+  assert.doesNotMatch(source, /View workspace document proposals/);
+  assert.doesNotMatch(source, /AI project intelligence unavailable/);
+  assert.match(source, /provisioningRun\?\.state === "ready" \|\| provisioningRun\?\.state === "partial"/);
+  assert.match(source, /window\.setInterval\(updateClock, 1_000\)/);
+  assert.doesNotMatch(source, /setInterval\([^)]*2[,_]?400/);
+  assert.doesNotMatch(source, /Marketing intent|Management intent|Autonomous operation/);
+  assert.doesNotMatch(source, /briefSignals/);
+  assert.doesNotMatch(source, /file\.text\(/);
+  assert.doesNotMatch(source, /documents: knowledgePayload/);
+  assert.doesNotMatch(source, /fetch\(`\/api\/planner/);
+  assert.match(contextRoute, /validateWorkspaceCreationUploadMetadata/);
+  assert.match(contextRoute, /content-length/);
+  assert.match(contextRoute, /readWorkspaceCreationFileWithinLimits/);
+  assert.ok(contextRoute.indexOf("contentLengthHeader") < contextRoute.indexOf("const body = await readWorkspaceCreationRequestBodyWithinLimit"));
+  assert.ok(contextRoute.indexOf("validateWorkspaceCreationUploadMetadata(files") < contextRoute.indexOf("readWorkspaceCreationFileWithinLimits(\n"));
+});
+
+test("Architect API routes use workspace authorization and never provision the final workspace", async () => {
+  const [generateRoute, reviseRoute] = await Promise.all([
+    readFile("app/api/workspaces/architect/route.ts", "utf8"),
+    readFile("app/api/workspaces/architect/revise/route.ts", "utf8")
+  ]);
+
+  assert.match(generateRoute, /requireAgentOsProductPermission\(request, "workspace\.manage"\)/);
+  assert.match(reviseRoute, /requireAgentOsProductPermission\(request, "workspace\.manage"\)/);
+  assert.match(generateRoute, /generateWorkspaceBlueprint/);
+  assert.match(reviseRoute, /reviseWorkspaceBlueprint/);
+  assert.match(generateRoute, /readWorkspaceCreationContext/);
+  assert.match(reviseRoute, /readWorkspaceCreationContext/);
+  assert.doesNotMatch(generateRoute, /documents/);
+  assert.doesNotMatch(reviseRoute, /documents/);
+  assert.doesNotMatch(generateRoute, /createWorkspaceProject/);
+  assert.doesNotMatch(reviseRoute, /createWorkspaceProject/);
+});

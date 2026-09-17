@@ -1,0 +1,58 @@
+import assert from "node:assert/strict";
+import { afterEach, test } from "node:test";
+
+import {
+  clearMissionControlCaches as clearApplicationMissionControlCaches,
+  getMissionControlSnapshot as getApplicationMissionControlSnapshot
+} from "@/lib/openclaw/application/mission-control-service";
+import { resetOpenClawEventBridgeForTesting } from "@/lib/openclaw/application/event-bridge-service";
+import { resetOpenClawGatewayClient } from "@/lib/openclaw/client/gateway-client-factory";
+import {
+  clearMissionControlCaches as clearCompatibilityMissionControlCaches,
+  getMissionControlSnapshot as getCompatibilityMissionControlSnapshot
+} from "@/lib/openclaw/service";
+
+const snapshotResponseKeys = [
+  "agentInbox",
+  "agents",
+  "channelAccounts",
+  "channelRegistry",
+  "diagnostics",
+  "generatedAt",
+  "missionPresets",
+  "mode",
+  "models",
+  "nativeChannelRouteBadges",
+  "nativeWork",
+  "presence",
+  "relationships",
+  "revision",
+  "runtimes",
+  "surfaceDrift",
+  "surfaceRuntime",
+  "tasks",
+  "workspaces"
+];
+
+afterEach(() => {
+  resetOpenClawEventBridgeForTesting();
+  resetOpenClawGatewayClient("mission control service compatibility test cleanup");
+  clearApplicationMissionControlCaches();
+  clearCompatibilityMissionControlCaches();
+});
+
+test("mission control service preserves the compatibility snapshot response shape", async () => {
+  clearCompatibilityMissionControlCaches();
+
+  const compatibilitySnapshot = await getCompatibilityMissionControlSnapshot({
+    force: true,
+    includeHidden: true
+  });
+  const applicationSnapshot = await getApplicationMissionControlSnapshot({
+    includeHidden: true
+  });
+
+  assert.deepEqual(Object.keys(compatibilitySnapshot).sort(), snapshotResponseKeys);
+  assert.deepEqual(Object.keys(applicationSnapshot).sort(), snapshotResponseKeys);
+  assert.deepEqual(applicationSnapshot, compatibilitySnapshot);
+});

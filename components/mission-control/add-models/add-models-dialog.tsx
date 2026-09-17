@@ -1,0 +1,3478 @@
+"use client";
+
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Boxes,
+  ChevronLeft,
+  CircleCheckBig,
+  Copy,
+  Database,
+  HardDrive,
+  HelpCircle,
+  KeyRound,
+  Library,
+  LoaderCircle,
+  RefreshCw,
+  Settings,
+  SquareTerminal,
+  Trash2
+} from "lucide-react";
+
+import { CustomProviderCard } from "@/components/mission-control/add-models/custom-provider-card";
+import { GlobalModelPicker } from "@/components/mission-control/add-models/global-model-picker";
+import { ModelPicker } from "@/components/mission-control/add-models/model-picker";
+import { ProviderLogo } from "@/components/mission-control/provider-logo";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { PikoLoader } from "@/components/ui/piko-loader";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
+import {
+  modelProviderRegistry,
+  buildExplicitModelProviderDescriptor,
+  formatModelProviderLabel,
+  getModelProviderDescriptor,
+  isAddModelsProviderId,
+  isBuiltInAddModelsProviderId,
+  normalizeAddModelsProviderId,
+  normalizeExplicitProviderId
+} from "@/lib/openclaw/model-provider-registry";
+import { getModelProviderAdapter, ModelProviderActionError } from "@/lib/openclaw/model-provider-adapters";
+import { modelMatchesAddModelsProvider } from "@/lib/openclaw/domains/model-provider-connection";
+import { isSelectableModel } from "@/lib/openclaw/domains/model-management";
+import { isOpenClawTerminalCommand } from "@/lib/openclaw/terminal-command";
+import { OPENCLAW_RECOMMENDED_VERSION } from "@/lib/openclaw/versions";
+import { useModelCatalog } from "@/hooks/use-model-catalog";
+import type {
+  AddModelsCatalogModel,
+  AddModelsEmptyState,
+  AddModelsFlowState,
+  AddModelsProviderActionResult,
+  AddModelsProviderConfigSummary,
+  AddModelsProviderConnectionStatus,
+  AddModelsProviderDisconnectImpact,
+  AddModelsProviderId,
+  MissionControlSnapshot
+} from "@/lib/agentos/contracts";
+import { cn } from "@/lib/utils";
+import { toast } from "@/components/ui/sonner";
+
+type ProviderDraft = {
+  flowState: AddModelsFlowState;
+  connection: AddModelsProviderConnectionStatus | null;
+  statusMessage: string | null;
+  errorMessage: string | null;
+  emptyState: AddModelsEmptyState | null;
+  manualCommand: string | null;
+  docsUrl: string | null;
+  models: AddModelsCatalogModel[];
+  selectedModelIds: string[];
+  providerName: string;
+  providerId: string;
+  apiKey: string;
+  endpoint: string;
+  manualModelId: string;
+  search: string;
+  loaded: boolean;
+  discoveryLoaded: boolean;
+  providerConfig: AddModelsProviderConfigSummary | null;
+};
+
+type ProviderDangerAction = {
+  kind: "disconnect-credential" | "delete-provider";
+  providerId: AddModelsProviderId;
+  impact: AddModelsProviderDisconnectImpact;
+};
+
+type SidebarFilter = "available" | "providers" | "catalog" | "local-models" | "defaults";
+
+const initialDraftState = (): ProviderDraft => ({
+  flowState: "idle",
+  connection: null,
+  statusMessage: null,
+  errorMessage: null,
+  emptyState: null,
+  manualCommand: null,
+  docsUrl: null,
+  models: [],
+  selectedModelIds: [],
+  providerName: "",
+  providerId: "",
+  apiKey: "",
+  endpoint: "",
+  manualModelId: "",
+  search: "",
+  loaded: false,
+  discoveryLoaded: false,
+  providerConfig: null
+});
+
+const CATALOG_PAGE_SIZE = 15;
+
+export function AddModelsDialog({
+  open,
+  onOpenChange,
+  snapshot,
+  initialProvider = null,
+  agentId = null,
+  onBack,
+  onConnectChatGPT,
+  onSwitchChatGptAccount,
+  onSnapshotChange,
+  onProviderSnapshotReady,
+  surfaceTheme = "dark"
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  snapshot: MissionControlSnapshot;
+  initialProvider?: AddModelsProviderId | null;
+  agentId?: string | null;
+  onBack?: () => void;
+  onConnectChatGPT?: (force?: boolean) => void;
+  onSwitchChatGptAccount?: () => void;
+  onSnapshotChange: (snapshot: MissionControlSnapshot) => void;
+  onProviderSnapshotReady?: (snapshot: MissionControlSnapshot) => void;
+  surfaceTheme?: "dark" | "light";
+}) {
+  const isLight = surfaceTheme === "light";
+  const normalizedInitialProvider = normalizeAddModelsProviderId(initialProvider);
+  const isInitialCustomProvider = normalizedInitialProvider === "custom";
+  const [activeTab, setActiveTab] = useState<"catalog" | "providers">("providers");
+  const [activeProvider, setActiveProvider] = useState<AddModelsProviderId | null>(normalizedInitialProvider);
+  const [providerDrafts, setProviderDrafts] = useState<Partial<Record<string, ProviderDraft>>>({});
+  const [isOpeningTerminal, setIsOpeningTerminal] = useState(false);
+  const [isAddingCatalogModels, setIsAddingCatalogModels] = useState(false);
+  const [catalogSearch, setCatalogSearch] = useState("");
+  const [catalogVisibleCount, setCatalogVisibleCount] = useState(CATALOG_PAGE_SIZE);
+  const [shouldScrollToProviderSettings, setShouldScrollToProviderSettings] = useState(false);
+  const [activeSetupMode, setActiveSetupMode] = useState<"standard" | "custom-openai-compatible">("standard");
+  const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>("providers");
+  const [explicitProviderIds, setExplicitProviderIds] = useState<string[]>([]);
+  const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
+  const [connectionEditorEndpoint, setConnectionEditorEndpoint] = useState("");
+  const [connectionEditorApi, setConnectionEditorApi] = useState("openai-completions");
+  const [connectionEditorCredential, setConnectionEditorCredential] = useState("");
+  const [isSavingConnection, setIsSavingConnection] = useState(false);
+  const [dangerAction, setDangerAction] = useState<ProviderDangerAction | null>(null);
+  const [isLoadingDangerImpact, setIsLoadingDangerImpact] = useState(false);
+  const [isApplyingDangerAction, setIsApplyingDangerAction] = useState(false);
+  const providerSettingsRef = useRef<HTMLElement | null>(null);
+  const {
+    models: globalCatalogModels,
+    isLoading: isLoadingGlobalCatalog,
+    error: globalCatalogError,
+    warning: globalCatalogWarning,
+    source: globalCatalogSource,
+    age: globalCatalogAge,
+    checkedAt: globalCatalogCheckedAt,
+    stale: globalCatalogStale,
+    refresh: refreshGlobalCatalog
+  } = useModelCatalog({
+    enabled: open,
+    snapshot,
+    view: "all"
+  });
+  const handleInitialProviderOpen = useEffectEvent((providerId: AddModelsProviderId) => {
+    setActiveSetupMode("standard");
+    setActiveTab("providers");
+    setSidebarFilter("providers");
+    void selectProvider(providerId);
+  });
+  const loadExplicitProviders = useEffectEvent(async () => {
+    try {
+      const response = await fetch("/api/models/providers");
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            providers?: Array<{
+              id?: string;
+              baseUrl?: string | null;
+              modelCount?: number;
+              api?: string | null;
+            }>;
+            error?: string;
+          }
+        | null;
+
+      if (!response.ok || !payload) {
+        throw new Error(payload?.error || "Custom providers could not be loaded.");
+      }
+
+      const providerSummaries = Array.isArray(payload.providers) ? payload.providers : [];
+      const providerIds = providerSummaries
+        .map((provider) => normalizeAddModelsProviderId(provider.id))
+        .filter((providerId): providerId is AddModelsProviderId => Boolean(providerId));
+
+      setExplicitProviderIds((current) => Array.from(new Set([...current, ...providerIds])));
+      setProviderDrafts((current) => {
+        const next = { ...current };
+
+        for (const provider of providerSummaries) {
+          const providerId = normalizeAddModelsProviderId(provider.id);
+
+          if (!providerId) {
+            continue;
+          }
+
+          const currentDraft = resolveDraft(next[providerId]);
+          next[providerId] = {
+            ...currentDraft,
+            endpoint: provider.baseUrl ?? currentDraft.endpoint,
+            providerConfig: {
+              provider: providerId,
+              kind: isBuiltInAddModelsProviderId(providerId) ? "builtin" : "custom",
+              providerId,
+              baseUrl: provider.baseUrl ?? null,
+              api: provider.api ?? null,
+              modelCount: provider.modelCount ?? 0,
+              credentialConfigured: false,
+              endpointOverride: Boolean(provider.baseUrl),
+              editable: true
+            },
+            connection: {
+              provider: providerId,
+              connected: Boolean(provider.baseUrl),
+              canConnect: true,
+              needsTerminal: false,
+              source: "openclaw-config",
+              degraded: false,
+              stale: false,
+              recovery: null,
+              detail: provider.baseUrl
+                ? `${provider.modelCount ?? 0} configured model${provider.modelCount === 1 ? "" : "s"} in OpenClaw. Endpoint: ${provider.baseUrl}.`
+                : "Custom provider is configured in OpenClaw."
+            },
+            loaded: currentDraft.loaded
+          };
+        }
+
+        return next;
+      });
+    } catch (error) {
+      toast.error("Custom providers could not be loaded.", {
+        description: error instanceof Error ? error.message : "OpenClaw provider config could not be read."
+      });
+    }
+  });
+
+  useEffect(() => {
+    if (!open) {
+      setActiveTab("providers");
+      setSidebarFilter("providers");
+      setActiveProvider(null);
+      setActiveSetupMode("standard");
+      setCatalogSearch("");
+      setCatalogVisibleCount(CATALOG_PAGE_SIZE);
+      setConnectionEditorOpen(false);
+      setConnectionEditorEndpoint("");
+      setConnectionEditorApi("openai-completions");
+      setConnectionEditorCredential("");
+      setDangerAction(null);
+      setIsSavingConnection(false);
+      setIsLoadingDangerImpact(false);
+      setIsApplyingDangerAction(false);
+      setProviderDrafts((current) =>
+        Object.fromEntries(
+          Object.entries(current).map(([providerId, draft]) => [
+            providerId,
+            providerId === "custom" ? initialDraftState() : {
+              ...draft,
+              flowState: "idle",
+              statusMessage: null,
+              errorMessage: null,
+              selectedModelIds: [],
+              providerName: "",
+              providerId: "",
+              apiKey: "",
+              endpoint: "",
+              manualModelId: "",
+              search: ""
+            }
+          ])
+    ) as Partial<Record<string, ProviderDraft>>
+      );
+      setIsOpeningTerminal(false);
+      setIsAddingCatalogModels(false);
+      return;
+    }
+
+    if (isInitialCustomProvider) {
+      setActiveProvider("custom");
+      setActiveSetupMode("custom-openai-compatible");
+      setActiveTab("providers");
+      setSidebarFilter("providers");
+      setProviderDrafts((current) => ({
+        ...current,
+        custom: initialDraftState()
+      }));
+    } else if (normalizedInitialProvider) {
+      handleInitialProviderOpen(normalizedInitialProvider);
+    } else {
+      setActiveSetupMode("standard");
+      setActiveTab("providers");
+      setSidebarFilter("providers");
+    }
+
+    void loadExplicitProviders();
+  }, [isInitialCustomProvider, open, normalizedInitialProvider]);
+
+  const snapshotExplicitProviderIds = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          snapshot.models
+            .map((model) => normalizeAddModelsProviderId(model.provider || model.id.split("/")[0]))
+            .filter(
+              (providerId): providerId is AddModelsProviderId =>
+                Boolean(providerId) && !isBuiltInAddModelsProviderId(providerId)
+            )
+        )
+      ),
+    [snapshot.models]
+  );
+  const effectiveExplicitProviderIds = useMemo(
+    () => Array.from(new Set([...explicitProviderIds, ...snapshotExplicitProviderIds])),
+    [explicitProviderIds, snapshotExplicitProviderIds]
+  );
+  const explicitProviderDescriptors = useMemo(
+    () =>
+      effectiveExplicitProviderIds.map((providerId) =>
+        buildExplicitModelProviderDescriptor(providerId, resolveDraft(providerDrafts[providerId]).providerName)
+      ),
+    [effectiveExplicitProviderIds, providerDrafts]
+  );
+  const providerDescriptors = useMemo(() => [...modelProviderRegistry, ...explicitProviderDescriptors], [explicitProviderDescriptors]);
+  const providerDescriptorsByStatus = useMemo(() => {
+    const buckets = {
+      connected: [] as typeof providerDescriptors,
+      detected: [] as typeof providerDescriptors,
+      notConnected: [] as typeof providerDescriptors
+    };
+
+    for (const provider of providerDescriptors) {
+      const connection = resolveConnectionDetail(snapshot, providerDrafts, provider.id);
+      const rank = getProviderSortRank(provider.id, isProviderConnectionReady(connection));
+
+      if (rank === 0) {
+        buckets.connected.push(provider);
+      } else if (rank === 1) {
+        buckets.detected.push(provider);
+      } else {
+        buckets.notConnected.push(provider);
+      }
+    }
+
+    const sortBucket = (bucket: typeof providerDescriptors) =>
+      bucket.sort((left, right) => formatModelProviderLabel(left.id).localeCompare(formatModelProviderLabel(right.id)));
+
+    return {
+      connected: sortBucket(buckets.connected),
+      detected: sortBucket(buckets.detected),
+      notConnected: sortBucket(buckets.notConnected)
+    };
+  }, [providerDescriptors, providerDrafts, snapshot]);
+  const providerCards = useMemo(
+    () =>
+      providerDescriptors
+        .map((provider) => {
+          const connection = resolveConnectionDetail(snapshot, providerDrafts, provider.id);
+
+          return {
+            provider,
+            connection,
+            statusRank: getProviderSortRank(provider.id, isProviderConnectionReady(connection))
+          };
+        })
+        .sort((left, right) => {
+          if (left.statusRank !== right.statusRank) {
+            return left.statusRank - right.statusRank;
+          }
+
+          return formatModelProviderLabel(left.provider.id).localeCompare(formatModelProviderLabel(right.provider.id));
+        }),
+    [providerDescriptors, providerDrafts, snapshot]
+  );
+  const defaultModelId = snapshot.diagnostics.modelReadiness.resolvedDefaultModel ?? snapshot.diagnostics.modelReadiness.defaultModel;
+  const defaultModelProviderId = defaultModelId ? normalizeAddModelsProviderId(defaultModelId.split("/")[0] ?? null) : null;
+  const defaultProviderId = providerCards[0]?.provider.id ?? null;
+  const activeProviderId = isAddModelsProviderId(activeProvider) ? activeProvider : null;
+  useEffect(() => {
+    if (!open || isInitialCustomProvider || activeProviderId || !defaultProviderId) {
+      return;
+    }
+
+    setActiveProvider(defaultProviderId);
+  }, [open, isInitialCustomProvider, activeProviderId, defaultProviderId]);
+  const activeDraft = activeProviderId ? resolveDraft(providerDrafts[activeProviderId]) : initialDraftState();
+  const activeDescriptor = activeProviderId
+    ? activeSetupMode === "custom-openai-compatible"
+      ? buildExplicitModelProviderDescriptor(resolveCustomDraftProviderId(activeDraft), activeDraft.providerName || "Custom provider")
+      : getModelProviderDescriptor(activeProviderId)
+    : null;
+  const activeProviderLabel =
+    activeSetupMode === "custom-openai-compatible"
+      ? activeDraft.providerName || "Custom provider"
+      : activeDescriptor?.shortLabel ?? "provider";
+  const activeConnection = activeProviderId
+    ? resolveConnectionDetail(snapshot, providerDrafts, activeProviderId)
+    : null;
+  const activeConnectionReady = isProviderConnectionReady(activeConnection);
+  const activeChatGptConnected = Boolean(
+    activeProviderId === "openai" &&
+    activeConnectionReady &&
+    activeConnection?.authMethod === "chatgpt-oauth"
+  );
+  const activeConnectionLabel = resolveProviderConnectionLabel(activeConnection, activeDescriptor?.connectKind);
+  const connectedProviderCount = providerDescriptorsByStatus.connected.length;
+  const availableProviderCards = providerCards.filter(({ connection }) => isProviderConnectionReady(connection));
+  const localProviderCards = providerCards.filter(({ provider }) => provider.connectKind === "local");
+  const defaultProviderCards = defaultModelProviderId
+    ? providerCards.filter(({ provider }) => provider.id === defaultModelProviderId)
+    : [];
+  const sidebarVisibleProviderCards =
+    sidebarFilter === "available"
+      ? availableProviderCards.length > 0
+        ? availableProviderCards
+        : providerCards
+      : sidebarFilter === "local-models"
+        ? localProviderCards.length > 0
+          ? localProviderCards
+          : providerCards
+        : sidebarFilter === "defaults"
+          ? defaultProviderCards.length > 0
+            ? defaultProviderCards
+            : providerCards
+          : providerCards;
+  const sidebarFilterLabel =
+    sidebarFilter === "available"
+      ? "Available"
+      : sidebarFilter === "local-models"
+        ? "Local models"
+        : sidebarFilter === "defaults"
+          ? "Defaults"
+          : sidebarFilter === "catalog"
+            ? "Catalog"
+            : "Providers";
+  const sidebarFilterDescription =
+    sidebarFilter === "available"
+      ? "Connected providers ready to use."
+      : sidebarFilter === "local-models"
+        ? "Local providers detected on this machine."
+        : sidebarFilter === "defaults"
+          ? "Provider behind the OpenClaw global default."
+          : sidebarFilter === "catalog"
+            ? "Browse the global model catalog."
+            : "Show all provider cards.";
+  const selectedProviderModelCount = activeProviderId
+    ? snapshot.models.filter((model) => modelMatchesProvider(activeProviderId, model.id, model.provider)).length +
+      activeDraft.models.length
+    : 0;
+  const selectedProviderMaxContext = activeProviderId
+    ? Math.max(
+        0,
+        ...snapshot.models
+          .filter((model) => modelMatchesProvider(activeProviderId, model.id, model.provider))
+          .map((model) => model.contextWindow ?? 0),
+        ...activeDraft.models.map((model) => model.contextWindow ?? 0)
+      )
+    : 0;
+  const showLoadingHero =
+    Boolean(activeProviderId && activeDescriptor) &&
+    (activeDraft.flowState === "discovery-loading" ||
+      activeDraft.flowState === "disconnecting" ||
+      (activeDraft.flowState === "connecting" && !activeDraft.manualCommand) ||
+      (activeDraft.statusMessage?.startsWith("Checking ") === true && !activeConnectionReady));
+  const loadingHeroTitle =
+    activeDraft.flowState === "discovery-loading"
+      ? `Discovering ${activeProviderLabel} models...`
+      : activeDraft.flowState === "disconnecting"
+        ? activeDraft.statusMessage || `Disconnecting ${activeProviderLabel}...`
+      : activeDraft.flowState === "connecting"
+        ? activeDraft.statusMessage || `Connecting ${activeProviderLabel}...`
+        : activeDraft.statusMessage || `Checking ${activeProviderLabel}...`;
+  const loadingHeroCopy =
+    activeDraft.flowState === "discovery-loading"
+      ? "Pulling the provider catalog into AgentOS."
+      : activeDraft.flowState === "disconnecting"
+        ? "Removing provider models, checking affected agents, and updating the OpenClaw global default when needed."
+      : activeDraft.flowState === "connecting"
+        ? activeProviderId === "openai"
+          ? "Complete the OpenClaw authorization page in your browser. AgentOS will refresh the provider automatically."
+          : "Preparing the provider connection."
+        : "Checking provider status before discovery.";
+  const isModelOperationInProgress =
+    isAddingCatalogModels ||
+    isOpeningTerminal ||
+    isSavingConnection ||
+    isLoadingDangerImpact ||
+    isApplyingDangerAction ||
+    showLoadingHero;
+  const modelOperationTitle = isAddingCatalogModels
+    ? "Adding selected models"
+    : isApplyingDangerAction
+      ? dangerAction?.kind === "delete-provider"
+        ? "Deleting provider"
+        : "Disconnecting provider"
+      : isLoadingDangerImpact
+        ? "Checking provider impact"
+        : isSavingConnection
+          ? "Saving provider connection"
+          : isOpeningTerminal
+            ? "Opening provider terminal"
+            : loadingHeroTitle;
+  const modelOperationDescription = isAddingCatalogModels
+    ? "Registering the selected models and refreshing the OpenClaw model catalog."
+    : isApplyingDangerAction
+      ? "Updating OpenClaw configuration and refreshing affected models and agents."
+      : isLoadingDangerImpact
+        ? "Checking affected models, agents, credentials, and the global default."
+        : isSavingConnection
+          ? "Applying provider settings through OpenClaw and refreshing connection status."
+          : isOpeningTerminal
+            ? "Opening the terminal so you can complete the provider login."
+            : loadingHeroCopy;
+  const shouldShowDiscoveryCta = Boolean(
+    activeProviderId &&
+      activeDescriptor &&
+      activeSetupMode !== "custom-openai-compatible" &&
+      activeDraft.models.length === 0
+  );
+  const showProviderConnectionForm = Boolean(
+    activeProviderId &&
+      activeDescriptor &&
+      activeDescriptor.connectKind === "apiKey" &&
+      (activeSetupMode === "custom-openai-compatible" || !activeConnectionReady)
+  );
+  const isDiscovering = activeDraft.flowState === "discovery-loading";
+  const isDisconnecting = activeDraft.flowState === "disconnecting";
+  const discoveryActionLabel =
+    activeDraft.models.length > 0 ? "Refresh discovery" : "Discover models";
+  const discoveryButtonLabel = isDiscovering ? "Discovering..." : discoveryActionLabel;
+  const discoveryDescription = activeConnectionReady
+    ? "The provider is connected. Pull the available models into this workspace before choosing one."
+    : activeSetupMode === "custom-openai-compatible"
+      ? "Configure the explicit OpenAI-compatible provider first, then pull the available models into this workspace."
+      : activeDescriptor?.connectKind === "oauth"
+      ? "Use your account login first, then pull the available models into this workspace."
+      : "Connect the provider first, then pull the available models into this workspace.";
+  const showGatewayRecoveryCommand = Boolean(
+    activeDraft.errorMessage &&
+    activeDraft.manualCommand &&
+    (/gateway/i.test(activeDraft.errorMessage) || /\bgateway\s+status\b/i.test(activeDraft.manualCommand))
+  );
+  const catalogModels = useMemo(() => {
+    return globalCatalogModels
+      .slice()
+      .sort((left, right) => {
+        const leftAlreadyAdded = left.alreadyAdded;
+        const rightAlreadyAdded = right.alreadyAdded;
+
+        if (leftAlreadyAdded !== rightAlreadyAdded) {
+          return leftAlreadyAdded ? 1 : -1;
+        }
+
+        const providerDelta = left.provider.localeCompare(right.provider);
+        if (providerDelta !== 0) {
+          return providerDelta;
+        }
+
+        const leftUnavailable = !isSelectableModel(left);
+        const rightUnavailable = !isSelectableModel(right);
+
+        if (leftUnavailable !== rightUnavailable) {
+          return leftUnavailable ? 1 : -1;
+        }
+
+        const leftPriority = Number(left.recommended) + Number(left.local);
+        const rightPriority = Number(right.recommended) + Number(right.local);
+        if (leftPriority !== rightPriority) {
+          return rightPriority - leftPriority;
+        }
+
+        const nameDelta = left.name.localeCompare(right.name);
+        if (nameDelta !== 0) {
+          return nameDelta;
+        }
+
+        return left.id.localeCompare(right.id);
+      });
+  }, [globalCatalogModels]);
+  const catalogSelectedModelIds = useMemo(
+    () => Object.values(providerDrafts).flatMap((draft) => draft?.selectedModelIds ?? []),
+    [providerDrafts]
+  );
+  const catalogModelById = useMemo(
+    () => new Map(catalogModels.map((model) => [model.id, model] as const)),
+    [catalogModels]
+  );
+  const catalogSelectedModelGroups = useMemo(() => {
+    const selectedModelIds = new Set(catalogSelectedModelIds);
+    const groups = new Map<string, string[]>();
+
+    for (const model of catalogModels) {
+      const providerId = model.provider;
+
+      if (!selectedModelIds.has(model.id) || model.alreadyAdded) {
+        continue;
+      }
+
+      const current = groups.get(providerId) ?? [];
+      current.push(model.id);
+      groups.set(providerId, current);
+    }
+
+    return groups;
+  }, [catalogModels, catalogSelectedModelIds]);
+  const activeCatalogSelectedCount = activeProviderId
+    ? catalogSelectedModelGroups.get(activeProviderId)?.length ?? 0
+    : 0;
+
+  useEffect(() => {
+    if (!shouldScrollToProviderSettings || !activeProviderId || typeof window === "undefined") {
+      return;
+    }
+
+    if (!window.matchMedia("(max-width: 1279px)").matches) {
+      setShouldScrollToProviderSettings(false);
+      return;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      providerSettingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setShouldScrollToProviderSettings(false);
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [activeProviderId, shouldScrollToProviderSettings]);
+  function focusSidebarFilter(filter: SidebarFilter) {
+    setSidebarFilter(filter);
+
+    if (filter === "catalog") {
+      setActiveTab("catalog");
+      return;
+    }
+
+    setActiveTab("providers");
+
+    const targetProviderId =
+      filter === "available"
+        ? availableProviderCards[0]?.provider.id ?? providerCards[0]?.provider.id ?? null
+        : filter === "local-models"
+          ? localProviderCards[0]?.provider.id ?? providerCards[0]?.provider.id ?? null
+          : filter === "defaults"
+            ? defaultModelProviderId ?? providerCards[0]?.provider.id ?? null
+            : providerCards[0]?.provider.id ?? null;
+
+    if (targetProviderId) {
+      void selectProvider(targetProviderId, { scrollToSettings: true });
+    }
+  }
+  async function selectProvider(
+    providerId: AddModelsProviderId,
+    { scrollToSettings = false }: { scrollToSettings?: boolean } = {}
+  ) {
+    setActiveProvider(providerId);
+    setActiveSetupMode("standard");
+    setActiveTab("providers");
+    setShouldScrollToProviderSettings(scrollToSettings);
+
+    if (!isBuiltInAddModelsProviderId(providerId)) {
+      setExplicitProviderIds((current) => current.includes(providerId) ? current : [...current, providerId]);
+    }
+
+    const draft = resolveDraft(providerDrafts[providerId]);
+
+    if (draft.loaded && draft.models.length > 0) {
+      return;
+    }
+
+    const status = await runStatus(providerId);
+
+    if (providerId === "ollama" && status?.connection.connected) {
+      await discoverProvider(providerId, true);
+    }
+  }
+
+  async function runStatus(providerId: AddModelsProviderId) {
+    const adapter = getModelProviderAdapter(providerId);
+
+    updateDraft(providerId, {
+      flowState: "idle",
+      errorMessage: null
+    });
+
+    try {
+      const result = await adapter.getConnectionStatus({ agentId });
+      applyActionResult(providerId, result, result.emptyState ? "discovery-empty" : "idle");
+
+      if (result.snapshot) {
+        onSnapshotChange(result.snapshot);
+      }
+
+      return result;
+    } catch (error) {
+      updateDraft(providerId, {
+        flowState: "auth-error",
+        errorMessage: error instanceof Error ? error.message : "Provider status could not be loaded.",
+        loaded: true
+      });
+
+      return null;
+    }
+  }
+
+  async function connectProvider(
+    providerId: AddModelsProviderId,
+    options?: {
+      force?: boolean;
+      endpoint?: string;
+      providerName?: string;
+      modelId?: string;
+      authMethod?: "api-key" | "chatgpt-oauth";
+    }
+  ) {
+    const adapter = getModelProviderAdapter(providerId);
+    const draft = resolveDraft(providerDrafts[providerId]);
+
+    updateDraft(providerId, {
+      flowState: "connecting",
+      errorMessage: null,
+      manualCommand: null,
+      statusMessage:
+        providerId === "openai" && options?.authMethod === "chatgpt-oauth"
+          ? options?.force
+            ? "Refreshing ChatGPT authorization..."
+            : "Opening ChatGPT authorization..."
+          : providerId === "openai" && options?.endpoint
+            ? "Connecting OpenAI-compatible endpoint..."
+          : `Connecting ${getModelProviderDescriptor(providerId).shortLabel}...`
+    });
+
+    try {
+      const result = await adapter.connect({
+        apiKey: draft.apiKey,
+        endpoint: options?.endpoint,
+        providerName: options?.providerName,
+        modelId: options?.modelId,
+        authMethod: options?.authMethod,
+        force: options?.force,
+        agentId
+      });
+
+      applyActionResult(
+        providerId,
+        result,
+        result.models.length ? "discovery-success" : "idle",
+        {
+          apiKey: "",
+          endpoint: providerId === "openai" && options?.endpoint ? options.endpoint : draft.endpoint
+        }
+      );
+
+      if (result.snapshot) {
+        onSnapshotChange(result.snapshot);
+      }
+    } catch (error) {
+      updateDraft(providerId, {
+        flowState: "auth-error",
+        errorMessage: error instanceof Error ? error.message : "Provider connection failed."
+      });
+    }
+  }
+
+  async function connectCustomProvider() {
+    const customDraft = resolveDraft(providerDrafts.custom);
+    const providerId = resolveCustomDraftProviderId(customDraft);
+    const providerName = customDraft.providerName.trim() || formatModelProviderLabel(providerId);
+
+    updateDraft("custom", {
+      flowState: "connecting",
+      errorMessage: null,
+      statusMessage: `Connecting ${providerName}...`
+    });
+
+    updateDraft(providerId, {
+      ...customDraft,
+      flowState: "connecting",
+      errorMessage: null,
+      statusMessage: `Connecting ${providerName}...`,
+      providerName,
+      providerId
+    });
+
+    try {
+      const adapter = getModelProviderAdapter(providerId);
+      const result = await adapter.connect({
+        apiKey: customDraft.apiKey,
+        endpoint: customDraft.endpoint,
+        providerName,
+        modelId: customDraft.manualModelId
+      });
+
+      setExplicitProviderIds((current) => current.includes(providerId) ? current : [...current, providerId]);
+      setActiveProvider(providerId);
+      setActiveSetupMode("standard");
+      applyActionResult(
+        providerId,
+        result,
+        result.models.length ? "discovery-success" : result.emptyState ? "discovery-empty" : "idle",
+        {
+          providerName,
+          providerId,
+          apiKey: "",
+          endpoint: customDraft.endpoint,
+          manualModelId: customDraft.manualModelId
+        }
+      );
+      updateDraft("custom", {
+        flowState: "idle",
+        statusMessage: null,
+        errorMessage: null,
+        apiKey: "",
+        manualModelId: ""
+      });
+
+      if (result.snapshot) {
+        onSnapshotChange(result.snapshot);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Custom provider connection failed.";
+      updateDraft("custom", {
+        flowState: "auth-error",
+        errorMessage: message
+      });
+      updateDraft(providerId, {
+        flowState: "auth-error",
+        errorMessage: message
+      });
+    }
+  }
+
+  async function discoverProvider(providerId: AddModelsProviderId, force = false) {
+    const adapter = getModelProviderAdapter(providerId);
+    const draft = resolveDraft(providerDrafts[providerId]);
+
+    if (!force && draft.flowState === "discovery-loading") {
+      return;
+    }
+
+    updateDraft(providerId, {
+      flowState: "discovery-loading",
+      errorMessage: null,
+      statusMessage:
+        providerId === "ollama"
+          ? "Checking the local Ollama runtime..."
+          : "Discovering available models..."
+    });
+
+    try {
+      const result = await adapter.discoverModels({ agentId });
+      applyActionResult(
+        providerId,
+        result,
+        result.models.length > 0
+          ? "discovery-success"
+          : result.emptyState
+            ? "discovery-empty"
+            : "idle"
+      );
+
+      if (result.snapshot) {
+        onSnapshotChange(result.snapshot);
+      }
+
+      return result;
+    } catch (error) {
+      const actionResult = readProviderActionErrorResult(error);
+      updateDraft(providerId, {
+        flowState: "auth-error",
+        errorMessage: error instanceof Error ? error.message : "Model discovery failed.",
+        manualCommand: actionResult?.manualCommand ?? null,
+        docsUrl: actionResult?.docsUrl ?? null
+      });
+
+      return null;
+    }
+  }
+
+  async function openConnectionEditor(providerId: AddModelsProviderId) {
+    const adapter = getModelProviderAdapter(providerId);
+
+    try {
+      const result = await adapter.getConnectionStatus({ agentId });
+      const providerConfig = result.providerConfig ??
+        resolveDraft(providerDrafts[providerId]).providerConfig;
+
+      if (!providerConfig?.editable) {
+        toast.error("Connection settings are managed by OpenClaw.", {
+          description: `${getModelProviderDescriptor(providerId).shortLabel} does not expose editable API-key settings here.`
+        });
+        return;
+      }
+
+      applyActionResult(providerId, result, "idle");
+
+      setConnectionEditorEndpoint(providerConfig.baseUrl ?? "");
+      setConnectionEditorApi(providerConfig.api ?? "openai-completions");
+      setConnectionEditorCredential("");
+      setConnectionEditorOpen(true);
+    } catch (error) {
+      toast.error("Connection settings could not be loaded.", {
+        description: error instanceof Error ? error.message : "OpenClaw provider configuration is unavailable."
+      });
+    }
+  }
+
+  async function saveConnectionEditor() {
+    if (!activeProviderId) {
+      return;
+    }
+
+    const adapter = getModelProviderAdapter(activeProviderId);
+    const providerConfig = activeDraft.providerConfig;
+
+    if (!providerConfig) {
+      return;
+    }
+
+    setIsSavingConnection(true);
+
+    try {
+      let result: AddModelsProviderActionResult | null = null;
+      const endpoint = connectionEditorEndpoint.trim();
+      const endpointChanged = endpoint !== (providerConfig.baseUrl ?? "");
+      const apiChanged = providerConfig.kind === "custom" &&
+        connectionEditorApi !== (providerConfig.api ?? "openai-completions");
+
+      if (endpointChanged || apiChanged) {
+        result = await adapter.updateProvider({
+          endpoint: endpoint || null,
+          api: providerConfig.kind === "custom" ? connectionEditorApi : undefined
+        });
+      }
+
+      if (connectionEditorCredential.trim()) {
+        result = await adapter.replaceCredential(connectionEditorCredential);
+      }
+
+      if (result) {
+        applyActionResult(activeProviderId, result, "idle", {
+          apiKey: "",
+          endpoint: result.providerConfig?.baseUrl ?? endpoint,
+          providerConfig: result.providerConfig ?? providerConfig
+        });
+      }
+
+      setConnectionEditorCredential("");
+      setConnectionEditorOpen(false);
+      await runStatus(activeProviderId);
+      toast.success("Connection settings saved.", {
+        description: connectionEditorCredential.trim()
+          ? "The credential was replaced without exposing its stored value."
+          : "OpenClaw provider settings were updated."
+      });
+    } catch (error) {
+      toast.error("Connection settings were not saved.", {
+        description: error instanceof Error ? error.message : "OpenClaw rejected the provider configuration."
+      });
+    } finally {
+      setIsSavingConnection(false);
+    }
+  }
+
+  async function requestProviderDangerAction(
+    providerId: AddModelsProviderId,
+    kind: ProviderDangerAction["kind"]
+  ) {
+    const adapter = getModelProviderAdapter(providerId);
+    setIsLoadingDangerImpact(true);
+
+    try {
+      const preview = kind === "delete-provider"
+        ? await adapter.getDeleteImpact()
+        : await adapter.getCredentialDisconnectImpact();
+      const impact = preview.disconnectImpact;
+
+      if (!impact) {
+        throw new Error("OpenClaw did not return provider impact details.");
+      }
+
+      setDangerAction({ kind, providerId, impact });
+    } catch (error) {
+      toast.error(kind === "delete-provider" ? "Provider cannot be deleted." : "Credential cannot be disconnected.", {
+        description: error instanceof Error ? error.message : "OpenClaw provider impact could not be inspected."
+      });
+    } finally {
+      setIsLoadingDangerImpact(false);
+    }
+  }
+
+  async function applyProviderDangerAction() {
+    if (!dangerAction) {
+      return;
+    }
+
+    const { providerId, kind } = dangerAction;
+    const adapter = getModelProviderAdapter(providerId);
+    const descriptor = getModelProviderDescriptor(providerId);
+    setIsApplyingDangerAction(true);
+    updateDraft(providerId, {
+      flowState: "disconnecting",
+      errorMessage: null,
+      statusMessage: kind === "delete-provider"
+        ? `Deleting ${descriptor.shortLabel}...`
+        : `Disconnecting ${descriptor.shortLabel} credential...`
+    });
+
+    try {
+      const result = kind === "delete-provider"
+        ? await adapter.deleteProvider()
+        : await adapter.disconnectCredential();
+      const currentDraft = resolveDraft(providerDrafts[providerId]);
+
+      applyActionResult(providerId, result, "idle", {
+        apiKey: "",
+        endpoint: kind === "delete-provider" ? "" : currentDraft.endpoint,
+        models: kind === "delete-provider" ? [] : currentDraft.models,
+        selectedModelIds: kind === "delete-provider" ? [] : currentDraft.selectedModelIds,
+        discoveryLoaded: kind === "delete-provider" ? false : currentDraft.discoveryLoaded,
+        manualCommand: null,
+        providerConfig: kind === "delete-provider" ? null : result.providerConfig ?? currentDraft.providerConfig
+      });
+
+      if (result.snapshot) {
+        onSnapshotChange(result.snapshot);
+      }
+
+      if (kind === "delete-provider") {
+        setExplicitProviderIds((current) => current.filter((entry) => entry !== providerId));
+        setActiveProvider(null);
+      }
+
+      setDangerAction(null);
+      setSidebarFilter("providers");
+      toast.success(
+        kind === "delete-provider"
+          ? `${descriptor.shortLabel} deleted.`
+          : `${descriptor.shortLabel} credential disconnected.`,
+        { description: result.message }
+      );
+    } catch (error) {
+      updateDraft(providerId, {
+        flowState: "auth-error",
+        errorMessage: error instanceof Error ? error.message : "Provider action failed.",
+        statusMessage: `${descriptor.shortLabel} was not changed.`
+      });
+      toast.error(`${descriptor.shortLabel} was not changed.`, {
+        description: error instanceof Error ? error.message : "OpenClaw rejected the provider action."
+      });
+    } finally {
+      setIsApplyingDangerAction(false);
+    }
+  }
+
+  async function addSelectedModels(
+    providerId: AddModelsProviderId,
+    options?: {
+      silent?: boolean;
+      selectedModelIds?: string[];
+    }
+  ) {
+    const adapter = getModelProviderAdapter(providerId);
+    const draft = resolveDraft(providerDrafts[providerId]);
+    const sourceSelectedModelIds = options?.selectedModelIds ?? draft.selectedModelIds;
+    const selectedModelIds = sourceSelectedModelIds.filter((modelId) => {
+      const model = catalogModelById.get(modelId) ?? draft.models.find((entry) => entry.id === modelId);
+      if (!model) {
+        return false;
+      }
+
+      return !model.alreadyAdded;
+    });
+
+    if (selectedModelIds.length === 0) {
+      return false;
+    }
+
+    updateDraft(providerId, {
+      flowState: "connecting",
+      errorMessage: null,
+      statusMessage: "Adding selected models..."
+    });
+
+    try {
+      const result = await adapter.addModels(selectedModelIds);
+
+      applyActionResult(providerId, result, "add-success", {
+        selectedModelIds: options?.selectedModelIds
+          ? draft.selectedModelIds.filter((modelId) => !selectedModelIds.includes(modelId))
+          : []
+      });
+
+      if (result.snapshot) {
+        onSnapshotChange(result.snapshot);
+      }
+
+      if (!options?.silent) {
+        toast.success("Models added.", {
+          description: result.message
+        });
+      }
+
+      return true;
+    } catch (error) {
+      const actionResult = readProviderActionErrorResult(error);
+      updateDraft(providerId, {
+        flowState: "add-error",
+        errorMessage: error instanceof Error ? error.message : "Models could not be added.",
+        connection: actionResult?.connection ?? draft.connection,
+        models: actionResult?.models ?? draft.models,
+        manualCommand: actionResult?.manualCommand ?? null,
+        docsUrl: actionResult?.docsUrl ?? null
+      });
+
+      return false;
+    }
+  }
+
+  async function addSelectedCatalogModels() {
+    const selectedProviderIds = [...catalogSelectedModelGroups.keys()];
+
+    if (selectedProviderIds.length === 0) {
+      return;
+    }
+
+    setIsAddingCatalogModels(true);
+
+    try {
+      let successCount = 0;
+
+      for (const [providerId, modelIds] of catalogSelectedModelGroups.entries()) {
+        const didAddModels = isAddModelsProviderId(providerId)
+          ? await addSelectedModels(providerId, {
+              silent: true,
+              selectedModelIds: modelIds
+            })
+          : await addCatalogProviderModels(providerId, modelIds);
+
+        if (didAddModels) {
+          successCount += modelIds.length;
+        }
+      }
+
+      if (successCount > 0) {
+        toast.success("Models added.", {
+          description:
+            `Added ${successCount} model${successCount === 1 ? "" : "s"} from ${selectedProviderIds.length} provider${selectedProviderIds.length === 1 ? "" : "s"}.`
+        });
+      } else {
+        toast.error("Models could not be added.", {
+          description: "Select a different catalog entry or open the Providers tab and try again."
+        });
+      }
+    } catch (error) {
+      toast.error("Models could not be added.", {
+        description: error instanceof Error ? error.message : "Select a different catalog entry or open the Providers tab and try again."
+      });
+    } finally {
+      setIsAddingCatalogModels(false);
+      void refreshGlobalCatalog(true);
+    }
+  }
+
+  function clearCatalogSelection() {
+    setProviderDrafts((current) => {
+      const next = { ...current };
+
+      for (const [providerId, draft] of Object.entries(next)) {
+        if (draft?.selectedModelIds.length) {
+          next[providerId] = { ...draft, selectedModelIds: [] };
+        }
+      }
+
+      return next;
+    });
+  }
+
+  async function addCatalogProviderModels(providerId: string, modelIds: string[]) {
+    const selectedModelIds = modelIds.filter((modelId) => {
+      const model = catalogModelById.get(modelId);
+      return model && !model.alreadyAdded;
+    });
+
+    if (selectedModelIds.length === 0) {
+      return false;
+    }
+
+    const response = await fetch("/api/models/catalog", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        provider: providerId,
+        modelIds: selectedModelIds
+      })
+    });
+    const result = (await response.json().catch(() => null)) as
+      | {
+          error?: string;
+          message?: string;
+          snapshot?: MissionControlSnapshot;
+        }
+      | null;
+
+    if (!response.ok || !result) {
+      throw new Error(result?.error || result?.message || "Catalog models could not be added.");
+    }
+
+    if (result.snapshot) {
+      onSnapshotChange(result.snapshot);
+    }
+
+    setProviderDrafts((current) =>
+      Object.fromEntries(
+        Object.entries(current).map(([draftProviderId, draft]) => [
+          draftProviderId,
+          draft
+            ? {
+                ...draft,
+                selectedModelIds: draft.selectedModelIds.filter((modelId) => !selectedModelIds.includes(modelId))
+              }
+            : draft
+        ])
+      ) as Partial<Record<AddModelsProviderId, ProviderDraft>>
+    );
+
+    return true;
+  }
+
+  async function openTerminal(command: string) {
+    try {
+      setIsOpeningTerminal(true);
+
+      const response = await fetch("/api/system/open-terminal", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          command
+        })
+      });
+
+      const result = (await response.json().catch(() => null)) as { error?: string } | null;
+
+      if (!response.ok) {
+        throw new Error(result?.error || "Terminal could not be opened.");
+      }
+
+      toast.success("Terminal opened.", {
+        description: "Finish the provider login there, then return here to discover models."
+      });
+    } catch (error) {
+      toast.error("Unable to open Terminal.", {
+        description: error instanceof Error ? error.message : "Unknown terminal error."
+      });
+    } finally {
+      setIsOpeningTerminal(false);
+    }
+  }
+
+  async function copyText(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success("Copied.", {
+        description: "Command copied to your clipboard."
+      });
+    } catch {
+      toast.error("Copy failed.", {
+        description: "Clipboard access is not available."
+      });
+    }
+  }
+
+  function updateDraft(providerId: string, patch: Partial<ProviderDraft>) {
+    setProviderDrafts((current) => ({
+      ...current,
+      [providerId]: {
+        ...resolveDraft(current[providerId]),
+        ...patch
+      }
+    }));
+  }
+
+  function readProviderActionErrorResult(error: unknown) {
+    return error instanceof ModelProviderActionError ? error.result : null;
+  }
+
+  function applyActionResult(
+    providerId: AddModelsProviderId,
+    result: AddModelsProviderActionResult,
+    flowState: AddModelsFlowState,
+    overrides?: Partial<ProviderDraft>
+  ) {
+    setProviderDrafts((current) => {
+      const currentDraft = resolveDraft(current[providerId]);
+      const shouldPreserveDiscoveredModels = result.action === "status" && result.models.length === 0;
+
+      return {
+        ...current,
+        [providerId]: {
+          ...currentDraft,
+          flowState,
+          connection: result.connection,
+          statusMessage: result.message,
+          errorMessage: null,
+          emptyState: result.emptyState ?? null,
+          manualCommand: result.manualCommand ?? null,
+          docsUrl: result.docsUrl ?? null,
+          providerConfig: result.providerConfig ?? currentDraft.providerConfig,
+          models: shouldPreserveDiscoveredModels ? currentDraft.models : result.models,
+          loaded: true,
+          discoveryLoaded:
+            currentDraft.discoveryLoaded || result.action === "discover" || result.models.length > 0,
+          ...overrides
+        }
+      };
+    });
+
+    if (result.snapshot) {
+      onProviderSnapshotReady?.(result.snapshot);
+    }
+  }
+
+  return (
+    <>
+      <PikoLoader
+        open={isModelOperationInProgress}
+        title={modelOperationTitle}
+        description={modelOperationDescription}
+      />
+      <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        closeClassName="right-3 top-[max(0.75rem,env(safe-area-inset-top))] sm:right-4 sm:top-4"
+        className={cn(
+          "flex h-dvh max-h-dvh w-screen max-w-none flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:h-[min(90dvh,900px)] sm:max-h-[90dvh] sm:w-[min(1420px,calc(100vw-64px))] sm:max-w-[1420px] sm:rounded-[26px] sm:border",
+          isLight
+            ? "border-border bg-card text-card-foreground shadow-[0_35px_100px_rgba(63,47,34,0.18),0_0_0_1px_rgba(120,92,66,0.08)]"
+            : "border-white/12 bg-[#070b14] text-white shadow-[0_35px_130px_rgba(0,0,0,0.68),0_0_80px_rgba(124,58,237,0.13)]"
+        )}
+      >
+        <DialogHeader
+          className={cn(
+            "relative shrink-0 border-b px-4 pb-3.5 pt-[max(1rem,env(safe-area-inset-top))] pr-12 sm:px-6 sm:py-4",
+            isLight
+              ? "border-border bg-[radial-gradient(circle_at_8%_0%,hsl(var(--primary)/0.10),transparent_28%),linear-gradient(180deg,hsl(var(--card)),hsl(var(--muted)/0.64))]"
+              : "border-white/10 bg-[radial-gradient(circle_at_8%_0%,rgba(124,58,237,0.16),transparent_28%),linear-gradient(180deg,rgba(11,17,30,0.98),rgba(7,11,20,0.98))]"
+          )}
+        >
+          <div className="flex items-center gap-3">
+            {onBack ? (
+              <button
+                type="button"
+                onClick={onBack}
+                aria-label="Back to Change Model"
+                title="Back to Change Model"
+                className={cn(
+                  "flex h-11 w-11 shrink-0 items-center justify-center rounded-[14px] border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60",
+                  isLight
+                    ? "border-primary/20 bg-primary/10 text-primary shadow-[0_18px_42px_rgba(124,58,237,0.10)] hover:bg-primary/15"
+                    : "border-violet-300/25 bg-[linear-gradient(145deg,rgba(124,58,237,0.88),rgba(76,29,149,0.92))] text-white shadow-[0_0_38px_rgba(124,58,237,0.28)] hover:brightness-110"
+                )}
+              >
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+            ) : (
+              <div
+                className={cn(
+                  "flex h-11 w-11 shrink-0 items-center justify-center rounded-[14px] border",
+                  isLight
+                    ? "border-primary/20 bg-primary/10 text-primary shadow-[0_18px_42px_rgba(124,58,237,0.10)]"
+                    : "border-violet-300/25 bg-[linear-gradient(145deg,rgba(124,58,237,0.88),rgba(76,29,149,0.92))] text-white shadow-[0_0_38px_rgba(124,58,237,0.28)]"
+                )}
+              >
+                <Library className="h-5 w-5" />
+              </div>
+            )}
+            <div>
+              <DialogTitle className={cn("font-display text-[1.35rem] leading-none tracking-[-0.03em]", isLight ? "text-foreground" : "text-white")}>
+                Model Library
+              </DialogTitle>
+              <DialogDescription className={cn("mt-1.5 max-w-[560px] text-[0.78rem] leading-4", isLight ? "text-muted-foreground" : "text-slate-300")}>
+                Manage providers and discover models.
+              </DialogDescription>
+            </div>
+          </div>
+        </DialogHeader>
+
+        <Tabs
+          value={activeTab}
+          onValueChange={(value) => setActiveTab(value as "catalog" | "providers")}
+          className={cn(
+            "min-h-0 flex flex-1 flex-col lg:grid lg:grid-cols-[190px_minmax(0,1fr)]",
+            isLight
+              ? "bg-[linear-gradient(180deg,hsl(var(--background)),hsl(var(--muted)/0.45))]"
+              : "bg-[linear-gradient(180deg,rgba(5,8,17,0.98),rgba(4,7,14,0.99))]"
+          )}
+        >
+          <div className={cn("flex shrink-0 flex-col overflow-x-auto border-b px-2 py-2 lg:min-h-0 lg:border-b-0 lg:border-r lg:px-3 lg:py-3", isLight ? "border-border bg-card/65" : "border-white/10 bg-slate-950/25")}>
+            <div className="flex min-w-max flex-row gap-1 max-lg:[&>button]:w-auto max-lg:[&>button]:rounded-full max-lg:[&>button]:px-2.5 max-lg:[&>button]:py-2 lg:min-w-0 lg:flex-col lg:gap-1.5">
+              <button
+                type="button"
+                aria-pressed={sidebarFilter === "available"}
+                onClick={() => focusSidebarFilter("available")}
+                className={cn(
+                  "group flex items-center justify-between gap-3 rounded-[14px] border px-3 py-2.5 text-left transition",
+                  sidebarFilter === "available"
+                    ? isLight
+                      ? "border-primary/25 bg-primary/10 text-primary shadow-[0_12px_30px_rgba(124,58,237,0.08)]"
+                      : "border-violet-400/35 bg-violet-500/15 text-white shadow-[0_12px_28px_rgba(124,58,237,0.18)]"
+                    : isLight
+                      ? "border-transparent bg-transparent text-foreground hover:border-border hover:bg-accent/50"
+                      : "border-transparent bg-white/[0.02] text-slate-300 hover:border-white/10 hover:bg-white/[0.05]"
+                )}
+              >
+                <span className="flex min-w-0 items-start gap-2.5">
+                  <span className={cn("flex h-8 w-8 items-center justify-center rounded-[10px] border", sidebarFilter === "available" ? (isLight ? "border-primary/20 bg-white/70" : "border-violet-300/25 bg-white/[0.08]") : isLight ? "border-border bg-background" : "border-white/10 bg-slate-950/40")}>
+                    <Boxes className={cn("h-4 w-4", sidebarFilter === "available" ? (isLight ? "text-primary" : "text-violet-200") : isLight ? "text-muted-foreground" : "text-slate-300")} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center justify-between gap-2">
+                      <span className={cn("block text-[0.82rem] font-medium leading-none", isLight ? "text-inherit" : "text-inherit")}>Available</span>
+                      <Badge
+                        variant="muted"
+                        className={cn(
+                          "h-6 shrink-0 rounded-full px-2.5 text-[0.64rem]",
+                          sidebarFilter === "available"
+                            ? isLight
+                              ? "border-primary/15 bg-white/60 text-primary"
+                              : "border-violet-300/20 bg-white/[0.08] text-white"
+                            : isLight
+                              ? "bg-card text-muted-foreground"
+                              : "bg-white/[0.04] text-slate-300"
+                        )}
+                      >
+                        {availableProviderCards.length}
+                      </Badge>
+                    </span>
+                    <span className={cn("mt-1 hidden text-[0.66rem] leading-none lg:block", sidebarFilter === "available" ? (isLight ? "text-primary/75" : "text-violet-100/75") : isLight ? "text-muted-foreground" : "text-slate-400")}>
+                      Connected providers
+                    </span>
+                  </span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                aria-pressed={sidebarFilter === "providers"}
+                onClick={() => focusSidebarFilter("providers")}
+                className={cn(
+                  "group flex items-center justify-between gap-3 rounded-[14px] border px-3 py-2.5 text-left transition",
+                  sidebarFilter === "providers"
+                    ? isLight
+                      ? "border-primary/25 bg-primary/10 text-primary shadow-[0_12px_30px_rgba(124,58,237,0.08)]"
+                      : "border-violet-400/35 bg-violet-500/15 text-white shadow-[0_12px_28px_rgba(124,58,237,0.18)]"
+                    : isLight
+                      ? "border-transparent bg-transparent text-foreground hover:border-border hover:bg-accent/50"
+                      : "border-transparent bg-white/[0.02] text-slate-300 hover:border-white/10 hover:bg-white/[0.05]"
+                )}
+              >
+                <span className="flex min-w-0 items-start gap-2.5">
+                  <span className={cn("flex h-8 w-8 items-center justify-center rounded-[10px] border", sidebarFilter === "providers" ? (isLight ? "border-primary/20 bg-white/70" : "border-violet-300/25 bg-white/[0.08]") : isLight ? "border-border bg-background" : "border-white/10 bg-slate-950/40")}>
+                    <Database className={cn("h-4 w-4", sidebarFilter === "providers" ? (isLight ? "text-primary" : "text-violet-200") : isLight ? "text-muted-foreground" : "text-slate-300")} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center justify-between gap-2">
+                      <span className={cn("block text-[0.82rem] font-medium leading-none", isLight ? "text-inherit" : "text-inherit")}>Providers</span>
+                      <Badge
+                        variant="muted"
+                        className={cn(
+                          "h-6 shrink-0 rounded-full px-2.5 text-[0.64rem]",
+                          sidebarFilter === "providers"
+                            ? isLight
+                              ? "border-primary/15 bg-white/60 text-primary"
+                              : "border-violet-300/20 bg-white/[0.08] text-white"
+                            : isLight
+                              ? "bg-card text-muted-foreground"
+                              : "bg-white/[0.04] text-slate-300"
+                        )}
+                      >
+                        {providerCards.length}
+                      </Badge>
+                    </span>
+                    <span className={cn("mt-1 hidden text-[0.66rem] leading-none lg:block", sidebarFilter === "providers" ? (isLight ? "text-primary/75" : "text-violet-100/75") : isLight ? "text-muted-foreground" : "text-slate-400")}>
+                      All provider cards
+                    </span>
+                  </span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                aria-pressed={sidebarFilter === "catalog"}
+                onClick={() => focusSidebarFilter("catalog")}
+                className={cn(
+                  "group flex items-center justify-between gap-3 rounded-[14px] border px-3 py-2.5 text-left transition",
+                  sidebarFilter === "catalog"
+                    ? isLight
+                      ? "border-primary/25 bg-primary/10 text-primary shadow-[0_12px_30px_rgba(124,58,237,0.08)]"
+                      : "border-violet-400/35 bg-violet-500/15 text-white shadow-[0_12px_28px_rgba(124,58,237,0.18)]"
+                    : isLight
+                      ? "border-transparent bg-transparent text-foreground hover:border-border hover:bg-accent/50"
+                      : "border-transparent bg-white/[0.02] text-slate-300 hover:border-white/10 hover:bg-white/[0.05]"
+                )}
+              >
+                <span className="flex min-w-0 items-start gap-2.5">
+                  <span className={cn("flex h-8 w-8 items-center justify-center rounded-[10px] border", sidebarFilter === "catalog" ? (isLight ? "border-primary/20 bg-white/70" : "border-violet-300/25 bg-white/[0.08]") : isLight ? "border-border bg-background" : "border-white/10 bg-slate-950/40")}>
+                    <Library className={cn("h-4 w-4", sidebarFilter === "catalog" ? (isLight ? "text-primary" : "text-violet-200") : isLight ? "text-muted-foreground" : "text-slate-300")} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center justify-between gap-2">
+                      <span className={cn("block text-[0.82rem] font-medium leading-none", isLight ? "text-inherit" : "text-inherit")}>Catalog</span>
+                      <Badge
+                        variant="muted"
+                        className={cn(
+                          "h-6 shrink-0 rounded-full px-2.5 text-[0.64rem]",
+                          sidebarFilter === "catalog"
+                            ? isLight
+                              ? "border-primary/15 bg-white/60 text-primary"
+                              : "border-violet-300/20 bg-white/[0.08] text-white"
+                            : isLight
+                              ? "bg-card text-muted-foreground"
+                              : "bg-white/[0.04] text-slate-300"
+                        )}
+                      >
+                        {globalCatalogModels.length > 0 ? globalCatalogModels.length : "—"}
+                      </Badge>
+                    </span>
+                    <span className={cn("mt-1 hidden text-[0.66rem] leading-none lg:block", sidebarFilter === "catalog" ? (isLight ? "text-primary/75" : "text-violet-100/75") : isLight ? "text-muted-foreground" : "text-slate-400")}>
+                      Browse global models
+                    </span>
+                  </span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                aria-pressed={sidebarFilter === "local-models"}
+                onClick={() => focusSidebarFilter("local-models")}
+                className={cn(
+                  "group flex items-center justify-between gap-3 rounded-[14px] border px-3 py-2.5 text-left transition",
+                  sidebarFilter === "local-models"
+                    ? isLight
+                      ? "border-primary/25 bg-primary/10 text-primary shadow-[0_12px_30px_rgba(124,58,237,0.08)]"
+                      : "border-violet-400/35 bg-violet-500/15 text-white shadow-[0_12px_28px_rgba(124,58,237,0.18)]"
+                    : isLight
+                      ? "border-transparent bg-transparent text-foreground hover:border-border hover:bg-accent/50"
+                      : "border-transparent bg-white/[0.02] text-slate-300 hover:border-white/10 hover:bg-white/[0.05]"
+                )}
+              >
+                <span className="flex min-w-0 items-start gap-2.5">
+                  <span className={cn("flex h-8 w-8 items-center justify-center rounded-[10px] border", sidebarFilter === "local-models" ? (isLight ? "border-primary/20 bg-white/70" : "border-violet-300/25 bg-white/[0.08]") : isLight ? "border-border bg-background" : "border-white/10 bg-slate-950/40")}>
+                    <HardDrive className={cn("h-4 w-4", sidebarFilter === "local-models" ? (isLight ? "text-primary" : "text-violet-200") : isLight ? "text-muted-foreground" : "text-slate-300")} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center justify-between gap-2">
+                      <span className={cn("block text-[0.82rem] font-medium leading-none", isLight ? "text-inherit" : "text-inherit")}>Local Models</span>
+                      <Badge
+                        variant="muted"
+                        className={cn(
+                          "h-6 shrink-0 rounded-full px-2.5 text-[0.64rem]",
+                          sidebarFilter === "local-models"
+                            ? isLight
+                              ? "border-primary/15 bg-white/60 text-primary"
+                              : "border-violet-300/20 bg-white/[0.08] text-white"
+                            : isLight
+                              ? "bg-card text-muted-foreground"
+                              : "bg-white/[0.04] text-slate-300"
+                        )}
+                      >
+                        {localProviderCards.length}
+                      </Badge>
+                    </span>
+                    <span className={cn("mt-1 hidden text-[0.66rem] leading-none lg:block", sidebarFilter === "local-models" ? (isLight ? "text-primary/75" : "text-violet-100/75") : isLight ? "text-muted-foreground" : "text-slate-400")}>
+                      Detected on this machine
+                    </span>
+                  </span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                aria-pressed={sidebarFilter === "defaults"}
+                onClick={() => focusSidebarFilter("defaults")}
+                className={cn(
+                  "group flex items-center justify-between gap-3 rounded-[14px] border px-3 py-2.5 text-left transition",
+                  sidebarFilter === "defaults"
+                    ? isLight
+                      ? "border-primary/25 bg-primary/10 text-primary shadow-[0_12px_30px_rgba(124,58,237,0.08)]"
+                      : "border-violet-400/35 bg-violet-500/15 text-white shadow-[0_12px_28px_rgba(124,58,237,0.18)]"
+                    : isLight
+                      ? "border-transparent bg-transparent text-foreground hover:border-border hover:bg-accent/50"
+                      : "border-transparent bg-white/[0.02] text-slate-300 hover:border-white/10 hover:bg-white/[0.05]"
+                )}
+              >
+                <span className="flex min-w-0 items-start gap-2.5">
+                  <span className={cn("flex h-8 w-8 items-center justify-center rounded-[10px] border", sidebarFilter === "defaults" ? (isLight ? "border-primary/20 bg-white/70" : "border-violet-300/25 bg-white/[0.08]") : isLight ? "border-border bg-background" : "border-white/10 bg-slate-950/40")}>
+                    <Settings className={cn("h-4 w-4", sidebarFilter === "defaults" ? (isLight ? "text-primary" : "text-violet-200") : isLight ? "text-muted-foreground" : "text-slate-300")} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center justify-between gap-2">
+                      <span className={cn("block text-[0.82rem] font-medium leading-none", isLight ? "text-inherit" : "text-inherit")}>Defaults</span>
+                      <Badge
+                        variant="muted"
+                        className={cn(
+                          "h-6 shrink-0 rounded-full px-2.5 text-[0.64rem]",
+                          sidebarFilter === "defaults"
+                            ? isLight
+                              ? "border-primary/15 bg-white/60 text-primary"
+                              : "border-violet-300/20 bg-white/[0.08] text-white"
+                            : isLight
+                              ? "bg-card text-muted-foreground"
+                              : "bg-white/[0.04] text-slate-300"
+                        )}
+                      >
+                        {defaultModelProviderId ? 1 : "—"}
+                      </Badge>
+                    </span>
+                    <span className={cn("mt-1 hidden text-[0.66rem] leading-none lg:block", sidebarFilter === "defaults" ? (isLight ? "text-primary/75" : "text-violet-100/75") : isLight ? "text-muted-foreground" : "text-slate-400")}>
+                      OpenClaw global default
+                    </span>
+                  </span>
+                </span>
+              </button>
+            </div>
+            <div className={cn("mt-auto hidden rounded-[16px] border p-3 text-[0.66rem] leading-4 lg:block", isLight ? "border-border bg-muted/35 text-muted-foreground" : "border-white/10 bg-white/[0.035] text-slate-400")}>
+              <HelpCircle className={cn("mb-1.5 h-4 w-4", isLight ? "text-muted-foreground" : "text-slate-300")} />
+              {sidebarFilterDescription}
+              <span className={cn("mt-2 block font-medium", isLight ? "text-primary" : "text-violet-300")}>{sidebarFilterLabel} filter</span>
+            </div>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+            <TabsContent value="providers" className="!mt-0 m-0 h-full">
+              <div className="grid min-h-full gap-0 xl:grid-cols-[minmax(0,1fr)_320px]">
+                <div className="space-y-3 px-4 py-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className={cn("font-display text-[1.05rem]", isLight ? "text-foreground" : "text-white")}>{sidebarFilterLabel}</p>
+                      <p className={cn("mt-0.5 text-[0.76rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>{sidebarFilterDescription}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge className={cn("px-2.5 py-1 text-[0.66rem]", isLight ? "border-emerald-300 bg-emerald-50 text-emerald-800" : "border-emerald-300/20 bg-emerald-400/10 text-emerald-200")}>
+                        <span className="mr-2 h-2 w-2 rounded-full bg-emerald-400" />
+                        {connectedProviderCount} Connected
+                      </Badge>
+                      <Badge variant="muted" className="px-2.5 py-1 text-[0.66rem]">
+                        {activeDraft.loaded ? "Selected provider loaded" : "Select a provider"}
+                      </Badge>
+                      <Badge
+                        variant={globalCatalogStale || globalCatalogWarning ? "warning" : "success"}
+                        className="px-2.5 py-1 text-[0.66rem]"
+                      >
+                        {globalCatalogStale
+                          ? "Catalog stale"
+                          : globalCatalogSource === "openclaw"
+                            ? "OpenClaw verified"
+                            : globalCatalogSource
+                              ? "Degraded evidence"
+                              : "Checking OpenClaw"}
+                      </Badge>
+                      <Button
+                        type="button"
+                        className={cn(
+                          "h-7 rounded-[9px] px-2.5 text-[0.66rem] font-medium",
+                          isLight
+                            ? "border border-border bg-card text-foreground shadow-none hover:border-primary/25 hover:bg-accent"
+                            : "bg-violet-600 text-white hover:bg-violet-500"
+                        )}
+                        disabled={!activeProviderId || isDiscovering || isDisconnecting}
+                        onClick={() => {
+                          if (activeProviderId) {
+                            void discoverProvider(activeProviderId, true);
+                          }
+                        }}
+                      >
+                        <RefreshCw className={cn("mr-1.5 h-3.5 w-3.5", isLight ? "text-primary" : "text-white")} />
+                        Refresh selected
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        className="h-7 rounded-[9px] px-2.5 text-[0.66rem]"
+                        disabled={isLoadingGlobalCatalog}
+                        onClick={() => {
+                          void refreshGlobalCatalog(true);
+                        }}
+                      >
+                        <RefreshCw className={cn("mr-1.5 h-3.5 w-3.5", isLoadingGlobalCatalog && "animate-spin")} />
+                        Reconcile library
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2.5 md:grid-cols-2 xl:grid-cols-3">
+                    {sidebarVisibleProviderCards.map(({ provider, connection }) => {
+                      const providerDraft = resolveDraft(providerDrafts[provider.id]);
+                      const providerDisconnecting = providerDraft.flowState === "disconnecting";
+                      const providerReady = isProviderConnectionReady(connection);
+                      const providerStateLabel = resolveProviderConnectionLabel(connection, provider.connectKind);
+                      const providerConnectedLabel = providerDisconnecting
+                        ? "Disconnecting"
+                        : providerStateLabel;
+                      const providerFooterLabel = providerDisconnecting
+                        ? "Removing provider"
+                        : providerReady
+                          ? "Configured"
+                          : provider.connectKind === "local"
+                            ? "Detected"
+                            : "Needs setup";
+                      const providerModelCount =
+                        snapshot.models.filter((model) => modelMatchesProvider(provider.id, model.id, model.provider)).length +
+                        providerDraft.models.length;
+                      const active = activeProviderId === provider.id && activeSetupMode === "standard";
+                      const isChatGPTProvider = provider.id === "openai";
+                      const showSwitchAccountAction =
+                        isChatGPTProvider && providerReady && connection.authMethod === "chatgpt-oauth";
+
+                      return (
+                        <div key={provider.id} className="h-full">
+                          <div
+                            className={cn(
+                              "flex h-[164px] flex-col overflow-hidden rounded-[14px] border transition",
+                              active
+                                ? isLight
+                                  ? "border-primary/45 bg-primary/10 shadow-[0_18px_44px_rgba(124,58,237,0.12)]"
+                                  : "border-violet-400 bg-[radial-gradient(circle_at_8%_0%,rgba(124,58,237,0.20),transparent_36%),linear-gradient(180deg,rgba(20,27,48,0.92),rgba(10,15,28,0.92))] shadow-[0_0_0_1px_rgba(168,85,247,0.22),0_0_34px_rgba(124,58,237,0.16)]"
+                                : isLight
+                                  ? "border-border bg-card hover:border-primary/25 hover:bg-accent/60"
+                                  : "border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.78),rgba(10,15,28,0.86))] hover:border-violet-300/35 hover:bg-white/[0.055]"
+                            )}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void selectProvider(provider.id, { scrollToSettings: true });
+                              }}
+                              className="min-h-0 w-full flex-1 overflow-hidden p-2.5 pb-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/55 focus-visible:ring-inset"
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                {provider.kind === "explicit" ? (
+                                  <span
+                                    className={cn(
+                                      "flex h-9 w-9 shrink-0 items-center justify-center rounded-[11px] border",
+                                      isLight
+                                        ? "border-primary/20 bg-primary/10 text-primary"
+                                        : "border-cyan-300/20 bg-cyan-300/10 text-cyan-100"
+                                    )}
+                                    aria-hidden="true"
+                                  >
+                                    <SquareTerminal className="h-4 w-4" />
+                                  </span>
+                                ) : (
+                                  <ProviderLogo provider={provider.id} className="h-9 w-9 rounded-[11px]" />
+                                )}
+                                <Badge
+                                  className={cn(
+                                    "px-2 py-0.5 text-[0.62rem]",
+                                    providerDisconnecting
+                                      ? isLight ? "border-cyan-300 bg-cyan-50 text-cyan-800" : "border-cyan-300/20 bg-cyan-400/10 text-cyan-200"
+                                      : providerReady
+                                      ? isLight ? "border-emerald-300 bg-emerald-50 text-emerald-800" : "border-emerald-300/20 bg-emerald-400/10 text-emerald-200"
+                                      : provider.connectKind === "local"
+                                        ? isLight ? "border-cyan-300 bg-cyan-50 text-cyan-800" : "border-cyan-300/20 bg-cyan-400/10 text-cyan-200"
+                                        : isLight ? "border-amber-300 bg-amber-50 text-amber-800" : "border-amber-300/20 bg-amber-400/10 text-amber-200"
+                                  )}
+                                >
+                                  {providerDisconnecting ? (
+                                    <LoaderCircle className="mr-1 h-3 w-3 animate-spin" />
+                                  ) : null}
+                                  {providerConnectedLabel}
+                                </Badge>
+                              </div>
+                              <p className={cn("mt-2.5 font-display text-[0.87rem]", isLight ? "text-foreground" : "text-white")}>{provider.label}</p>
+                              <p className={cn("mt-1 line-clamp-2 text-[0.72rem] leading-[1.15]", isLight ? "text-muted-foreground" : "text-slate-300")}>{provider.description}</p>
+                              <div className={cn("mt-2 text-[0.64rem] leading-4", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                                <p className="line-clamp-1">
+                                  {providerModelCount} model{providerModelCount === 1 ? "" : "s"}
+                                </p>
+                                <p className="line-clamp-1">
+                                  {providerDisconnecting
+                                    ? providerDraft.statusMessage || "Disconnect in progress..."
+                                    : connection.detail || provider.helperText}
+                                </p>
+                              </div>
+                            </button>
+
+                            <div className="flex min-h-8 shrink-0 items-end px-2.5 pb-2.5">
+                              <div className="flex min-w-0 w-full items-center gap-1.5">
+                                <span className={cn("inline-flex h-6 min-w-0 items-center truncate rounded-[9px] border px-2.5 text-[0.64rem] font-medium", isLight ? "border-border bg-muted/45 text-foreground" : "border-white/10 bg-white/[0.04] text-white")}>
+                                  {providerFooterLabel}
+                                </span>
+                                {showSwitchAccountAction && onSwitchChatGptAccount ? (
+                                  <Button
+                                    type="button"
+                                    variant="secondary"
+                                    className={cn(
+                                      "h-6 min-w-0 shrink px-2.5 text-[0.64rem] shadow-none",
+                                      isLight
+                                        ? "border border-border bg-card text-foreground hover:border-primary/25 hover:bg-accent"
+                                        : "border border-white/10 bg-white/[0.04] text-white hover:border-violet-300/30 hover:bg-violet-400/10"
+                                    )}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      onSwitchChatGptAccount();
+                                    }}
+                                  >
+                                    <span className="truncate">Switch account</span>
+                                  </Button>
+                                ) : null}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <CustomProviderCard
+                      active={activeProviderId === "custom" && activeSetupMode === "custom-openai-compatible"}
+                      surfaceTheme={surfaceTheme}
+                      connected={false}
+                      detail={resolveCustomEndpointDetail(resolveDraft(providerDrafts.custom)?.endpoint)}
+                      onClick={() => {
+                        setActiveProvider("custom");
+                        setActiveSetupMode("custom-openai-compatible");
+                        setActiveTab("providers");
+                      }}
+                    />
+                  </div>
+
+                <div className={cn("rounded-[18px] border p-3", isLight ? "border-border bg-card shadow-card" : "border-white/10 bg-[linear-gradient(180deg,rgba(11,18,32,0.96),rgba(6,10,18,0.98))]")}>
+                  {activeProviderId && activeDescriptor ? (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className={cn("font-display text-[0.88rem]", isLight ? "text-foreground" : "text-white")}>
+                            {activeSetupMode === "custom-openai-compatible"
+                              ? "Custom OpenAI-compatible provider"
+                              : activeDescriptor.label}
+                          </p>
+                        </div>
+                        <Badge
+                          variant={isDisconnecting ? "muted" : activeConnectionReady ? "success" : "muted"}
+                          className={cn(
+                            "px-1.5 py-0.5 text-[9px] tracking-[0.12em]",
+                            isDisconnecting &&
+                              (isLight
+                                ? "border-cyan-300 bg-cyan-50 text-cyan-800"
+                                : "border-cyan-300/20 bg-cyan-400/10 text-cyan-200"),
+                            isLight &&
+                              !isDisconnecting &&
+                              activeConnectionReady &&
+                              "border-emerald-300 bg-emerald-50 text-emerald-800",
+                            isLight &&
+                              !isDisconnecting &&
+                              !activeConnectionReady &&
+                              "border-[#e3dbd0] bg-white/70 text-[#71675d]"
+                          )}
+                        >
+                          {isDisconnecting ? "Disconnecting" : activeConnectionLabel}
+                          </Badge>
+                      </div>
+
+                      <div className="mt-3 flex flex-wrap gap-1">
+                        {buildProgressSteps(activeProviderId, activeDraft, activeConnection).map((step) => (
+                          <div
+                            key={step.label}
+                            className={cn(
+                              "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[9px] uppercase tracking-[0.14em]",
+                              step.status === "done"
+                                ? isLight
+                                  ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+                                  : "border-emerald-300/20 bg-emerald-300/10 text-emerald-100"
+                                : step.status === "active"
+                                  ? isLight ? "border-cyan-300 bg-cyan-50 text-cyan-800" : "border-cyan-300/20 bg-cyan-300/10 text-cyan-100"
+                                  : isLight ? "border-border bg-muted/40 text-muted-foreground" : "border-white/10 bg-white/[0.03] text-slate-500"
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                "h-1.5 w-1.5 rounded-full",
+                                step.status === "done"
+                                  ? "bg-emerald-300"
+                                  : step.status === "active"
+                                    ? "bg-cyan-300"
+                                    : "bg-slate-600"
+                              )}
+                            />
+                            {step.label}
+                          </div>
+                        ))}
+                      </div>
+
+                      {activeDraft.statusMessage && !showLoadingHero ? (
+                        <div className={cn("mt-3 rounded-[16px] border px-3 py-2", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.04]")}>
+                          <p className={cn("text-[11px]", isLight ? "text-foreground" : "text-slate-200")}>{activeDraft.statusMessage}</p>
+                        </div>
+                      ) : null}
+
+                      {activeDraft.errorMessage ? (
+                        <div className={cn("mt-3 rounded-[16px] border px-3 py-2 text-[11px]", isLight ? "border-rose-200 bg-rose-50 text-rose-800" : "border-rose-400/20 bg-rose-400/[0.08] text-rose-100")}>
+                          {activeDraft.errorMessage}
+                        </div>
+                      ) : null}
+
+                      {showGatewayRecoveryCommand ? (
+                        <div className={cn("mt-3 rounded-[16px] border px-3 py-2", isLight ? "border-amber-200 bg-amber-50" : "border-amber-300/20 bg-amber-300/[0.08]")}>
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <p className={cn("text-[11px] font-medium", isLight ? "text-amber-900" : "text-amber-50")}>Gateway recovery</p>
+                              <p className={cn("mt-1 max-w-[480px] text-[10px] leading-[0.98rem]", isLight ? "text-amber-800" : "text-amber-100/78")}>
+                                Automatic Gateway auth repair did not finish. Inspect Gateway status, then retry adding models.
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {isOpenClawTerminalCommand(activeDraft.manualCommand) ? (
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  size="sm"
+                                  className="h-7 rounded-full px-2.5 text-[10px]"
+                                  disabled={isOpeningTerminal}
+                                  onClick={() => {
+                                    void openTerminal(activeDraft.manualCommand || "");
+                                  }}
+                                >
+                                  {isOpeningTerminal ? (
+                                    <>
+                                      <LoaderCircle className="mr-1.5 h-3 w-3 animate-spin" />
+                                      Opening...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <SquareTerminal className="mr-1.5 h-3 w-3" />
+                                      Open Terminal
+                                    </>
+                                  )}
+                                </Button>
+                              ) : null}
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 rounded-full px-2.5 text-[10px]"
+                                onClick={() => {
+                                  void copyText(activeDraft.manualCommand || "");
+                                }}
+                              >
+                                <Copy className="mr-1.5 h-3 w-3" />
+                                Copy command
+                              </Button>
+                            </div>
+                          </div>
+                          <div className={cn("mt-2.5 overflow-x-auto rounded-[14px] border px-3 py-2", isLight ? "border-amber-200 bg-white/70" : "border-white/10 bg-slate-950/60")}>
+                            <code className={cn("text-[10px]", isLight ? "text-foreground" : "text-slate-200")}>{activeDraft.manualCommand}</code>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {!showLoadingHero ? (
+                        <>
+                          {activeProviderId === "openai" ? (
+                            <div className={cn("mt-4 rounded-[20px] border p-3", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.03]")}>
+                              <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div>
+                                    <p className={cn("font-display text-[0.88rem]", isLight ? "text-foreground" : "text-white")}>Connect ChatGPT</p>
+                                  <p className={cn("mt-1 max-w-[500px] text-[10px] leading-[0.98rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                                    OpenClaw {OPENCLAW_RECOMMENDED_VERSION} uses provider <code>openai</code>, runtime <code>codex</code>, and plugin <code>@openclaw/codex</code> for ChatGPT OAuth.
+                                  </p>
+                                </div>
+                                <Button
+                                  type="button"
+                                  className="h-8 rounded-full px-3 text-[10px]"
+                                  disabled={activeDraft.flowState === "connecting" && !activeDraft.manualCommand}
+                                  onClick={() => {
+                                    if (activeChatGptConnected) {
+                                      void runStatus(activeProviderId);
+                                      return;
+                                    }
+
+                                    if (onConnectChatGPT) {
+                                      onConnectChatGPT(false);
+                                      return;
+                                    }
+
+                                    void connectProvider(activeProviderId, { authMethod: "chatgpt-oauth" });
+                                  }}
+                                >
+                                  {activeDraft.flowState === "connecting" && !activeDraft.manualCommand ? (
+                                    <>
+                                      <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                                      Connecting...
+                                    </>
+                                  ) : (
+                                    activeChatGptConnected ? "Refresh status" : "Connect ChatGPT"
+                                  )}
+                                </Button>
+                                {!activeChatGptConnected || onSwitchChatGptAccount ? (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    className="h-8 rounded-full px-3 text-[10px]"
+                                    disabled={activeDraft.flowState === "connecting" && !activeDraft.manualCommand}
+                                    onClick={() => {
+                                      if (activeChatGptConnected) {
+                                        onSwitchChatGptAccount?.();
+                                        return;
+                                      }
+
+                                      if (onConnectChatGPT) {
+                                        onConnectChatGPT(true);
+                                        return;
+                                      }
+
+                                      void connectProvider(activeProviderId, { force: true, authMethod: "chatgpt-oauth" });
+                                    }}
+                                  >
+                                    {activeChatGptConnected ? "Switch account" : "Refresh setup"}
+                                  </Button>
+                                ) : null}
+                              </div>
+
+                            </div>
+                          ) : null}
+
+                          {false ? (
+                            <div className={cn("mt-4 rounded-[20px] border p-3", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.03]")}>
+                              {activeSetupMode === "custom-openai-compatible" ? (
+                                <div className={cn("mb-3 rounded-[16px] border px-3 py-2", isLight ? "border-cyan-200 bg-cyan-50" : "border-cyan-300/20 bg-cyan-300/[0.07]")}>
+                                  <p className={cn("text-[11px] font-medium", isLight ? "text-cyan-900" : "text-cyan-50")}>Custom OpenAI-compatible provider</p>
+                                  <p className={cn("mt-1 max-w-[500px] text-[10px] leading-[0.98rem]", isLight ? "text-cyan-800" : "text-cyan-100/80")}>
+                                    OpenClaw stores this as an explicit provider under <code>models.providers.&lt;id&gt;</code>. Use a `/v1` base URL and an API key from your provider.
+                                  </p>
+                                </div>
+                              ) : null}
+                              <div className="flex flex-wrap items-end gap-3">
+                                {activeSetupMode === "custom-openai-compatible" ? (
+                                  <>
+                                    <div className="min-w-[220px] flex-1">
+                                      <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                        Base URL
+                                      </label>
+                                      <Input
+                                        type="url"
+                                        value={activeDraft.endpoint}
+                                        onChange={(event) => updateDraft(activeProviderId!, { endpoint: event.target.value })}
+                                        placeholder="https://api.entrim.ai/v1"
+                                        className="mt-1.5 h-8 text-[11px]"
+                                      />
+                                    </div>
+                                    <div className="min-w-[180px] flex-1">
+                                      <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                        Manual model ID
+                                      </label>
+                                      <Input
+                                        value={activeDraft.manualModelId}
+                                        onChange={(event) => updateDraft(activeProviderId!, { manualModelId: event.target.value })}
+                                        placeholder="Optional if discovery is empty"
+                                        className="mt-1.5 h-8 text-[11px]"
+                                      />
+                                    </div>
+                                  </>
+                                ) : null}
+                                {activeSetupMode !== "custom-openai-compatible" ? (
+                                  <div className="min-w-0 flex-1">
+                                    <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                      API key
+                                    </label>
+                                    <Input
+                                      type="password"
+                                      value={activeDraft.apiKey}
+                                      onChange={(event) => updateDraft(activeProviderId!, { apiKey: event.target.value })}
+                                      placeholder={activeProviderId === "openrouter" ? "sk-or-v1-..." : "Paste API key"}
+                                      className="mt-1.5 h-8 text-[11px]"
+                                    />
+                                  </div>
+                                ) : null}
+                                {activeSetupMode === "custom-openai-compatible" ? (
+                                  <div className="min-w-[220px] flex-1">
+                                    <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                      API key
+                                    </label>
+                                    <Input
+                                      type="password"
+                                      value={activeDraft.apiKey}
+                                      onChange={(event) => updateDraft(activeProviderId!, { apiKey: event.target.value })}
+                                      placeholder="Paste provider API key"
+                                      className="mt-1.5 h-8 text-[11px]"
+                                    />
+                                  </div>
+                                ) : null}
+                                {activeSetupMode === "custom-openai-compatible" ? (
+                                  <p className={cn("w-full text-[9px] leading-[0.9rem]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                    Provider ID is inferred as {resolveCustomDraftProviderId(activeDraft) || "provider-id"} from the base URL. Models are saved as {resolveCustomDraftProviderId(activeDraft) || "provider-id"}/&lt;model&gt;.
+                                  </p>
+                                ) : null}
+                                <Button
+                                  type="button"
+                                  className="h-8 rounded-full px-3 text-[10px]"
+                                  disabled={
+                                    activeDraft.flowState === "connecting" ||
+                                    !activeDraft.apiKey.trim() ||
+                                    (activeSetupMode === "custom-openai-compatible" &&
+                                      (!activeDraft.endpoint.trim() ||
+                                        !resolveCustomDraftProviderId(activeDraft).trim()))
+                                  }
+                                  onClick={() => {
+                                    if (activeSetupMode === "custom-openai-compatible") {
+                                      void connectCustomProvider();
+                                      return;
+                                    }
+
+                                    void connectProvider(activeProviderId!);
+                                  }}
+                                >
+                                  {activeDraft.flowState === "connecting" ? (
+                                    <>
+                                      <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                                      Connecting...
+                                    </>
+                                  ) : activeSetupMode === "custom-openai-compatible"
+                                    ? "Connect custom provider"
+                                    : `Connect ${activeDescriptor!.shortLabel}`}
+                                </Button>
+                              </div>
+                              {activeDraft.manualCommand ? (
+                                <div className={cn("mt-3 rounded-[16px] border p-3", isLight ? "border-cyan-200 bg-cyan-50" : "border-cyan-300/15 bg-cyan-300/[0.07]")}>
+                                  <div className="flex flex-wrap items-start justify-between gap-3">
+                                    <div>
+                                      <p className={cn("text-[11px] font-medium", isLight ? "text-cyan-900" : "text-cyan-50")}>Finish setup in Terminal</p>
+                                      <p className={cn("mt-1 max-w-[480px] text-[10px] leading-[0.98rem]", isLight ? "text-cyan-800" : "text-cyan-100/80")}>
+                                        Open Terminal, paste the provider API key there, then return here and check discovery.
+                                      </p>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                      <Button
+                                        type="button"
+                                        variant="secondary"
+                                        size="sm"
+                                        className="h-7 rounded-full px-2.5 text-[10px]"
+                                        disabled={isOpeningTerminal}
+                                        onClick={() => {
+                                          void openTerminal(activeDraft.manualCommand || "");
+                                        }}
+                                      >
+                                        {isOpeningTerminal ? (
+                                          <>
+                                            <LoaderCircle className="mr-1.5 h-3 w-3 animate-spin" />
+                                            Opening...
+                                          </>
+                                        ) : (
+                                          <>
+                                            <SquareTerminal className="mr-1.5 h-3 w-3" />
+                                            Open Terminal
+                                          </>
+                                        )}
+                                      </Button>
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 rounded-full px-2.5 text-[10px]"
+                                        onClick={() => {
+                                          void copyText(activeDraft.manualCommand || "");
+                                        }}
+                                      >
+                                        <Copy className="mr-1.5 h-3 w-3" />
+                                        Copy command
+                                      </Button>
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 rounded-full px-2.5 text-[10px]"
+                                        onClick={() => {
+                                          void discoverProvider(activeProviderId!);
+                                        }}
+                                      >
+                                        <RefreshCw className="mr-1.5 h-3 w-3" />
+                                        I&apos;ve connected it
+                                      </Button>
+                                    </div>
+                                  </div>
+                                  <div className={cn("mt-2.5 overflow-x-auto rounded-[14px] border px-3 py-2", isLight ? "border-cyan-200 bg-white/70" : "border-white/10 bg-slate-950/60")}>
+                                    <code className={cn("text-[10px]", isLight ? "text-foreground" : "text-slate-200")}>{activeDraft.manualCommand}</code>
+                                  </div>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
+
+                        </>
+                      ) : (
+                        <div
+                          className={cn(
+                            "mt-4 flex min-h-[260px] items-center justify-center overflow-hidden rounded-[24px] border px-4 py-10 text-center",
+                            isLight
+                              ? "border-cyan-200 bg-[radial-gradient(circle_at_top,rgba(207,244,250,0.9),rgba(255,252,248,0.98)_70%)] shadow-[0_22px_52px_rgba(122,91,68,0.12)]"
+                              : "border-cyan-300/20 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.16),rgba(8,15,28,0.98)_70%)] shadow-[0_22px_52px_rgba(7,11,20,0.32)]"
+                          )}
+                        >
+                          <div className="relative flex max-w-[340px] flex-col items-center">
+                            <div className="absolute inset-x-8 top-8 h-px bg-gradient-to-r from-transparent via-cyan-200/70 to-transparent blur-sm animate-pulse" />
+                            <div className="absolute inset-x-8 bottom-8 h-px bg-gradient-to-r from-transparent via-cyan-200/30 to-transparent blur-sm animate-pulse [animation-delay:180ms]" />
+                            <div className="absolute left-8 top-8 h-24 w-24 rounded-full border border-cyan-300/15 bg-cyan-300/[0.04] blur-[1px] animate-pulse" />
+                            <div className="absolute right-10 top-14 h-16 w-16 rounded-full border border-cyan-300/10 bg-cyan-300/[0.03] blur-[1px] animate-pulse [animation-delay:120ms]" />
+                            <div className="absolute bottom-10 left-1/2 h-20 w-20 -translate-x-1/2 rounded-full border border-cyan-300/10 bg-cyan-300/[0.03] blur-[1px] animate-pulse [animation-delay:240ms]" />
+                            <div className="relative mb-4 flex h-16 w-16 items-center justify-center rounded-full border border-cyan-300/20 bg-cyan-300/[0.08] shadow-[0_0_0_8px_rgba(34,211,238,0.05)]">
+                              <LoaderCircle className="h-8 w-8 animate-spin text-cyan-200" />
+                            </div>
+                            <p className={cn("font-display text-[1.1rem] leading-[1.2rem] tracking-[0.01em]", isLight ? "text-foreground" : "text-white")}>
+                              {loadingHeroTitle}
+                            </p>
+                            <p className={cn("mt-2 max-w-[280px] text-[11px] leading-[1rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                              {loadingHeroCopy}
+                            </p>
+                            <div className="mt-4 flex gap-1.5">
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-300/90" />
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-300/60 [animation-delay:120ms]" />
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-300/30 [animation-delay:240ms]" />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className={cn("flex min-h-[180px] items-center justify-center rounded-[20px] border border-dashed px-4 py-6 text-center", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.02]")}>
+                      <div>
+                        <p className={cn("font-display text-[0.88rem]", isLight ? "text-foreground" : "text-white")}>Choose a provider to begin</p>
+                        <p className={cn("mt-1.5 max-w-[360px] text-[11px] leading-[0.98rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                          Start with ChatGPT, OpenRouter, Gemini, DeepSeek, Mistral, or Ollama Local. The flow will
+                          guide you through connect, discovery, selection, and add.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                </div>
+                <aside
+                  ref={providerSettingsRef}
+                  className={cn(
+                    "border-t p-4 xl:border-l xl:border-t-0",
+                    isLight
+                      ? "border-border bg-card/80"
+                      : "border-white/10 bg-[linear-gradient(180deg,rgba(10,15,28,0.92),rgba(6,9,18,0.96))]"
+                  )}
+                >
+                  {activeProviderId && activeDescriptor ? (
+                    <div className="sticky top-0">
+                      {activeCatalogSelectedCount > 0 ? (
+                        <div
+                          className={cn(
+                            "mb-3 rounded-[14px] border px-3 py-2.5",
+                            isLight
+                              ? "border-primary/25 bg-primary/10 text-foreground"
+                              : "border-violet-300/25 bg-violet-500/10 text-white"
+                          )}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <p className="text-[0.74rem] font-semibold">
+                                {activeCatalogSelectedCount} catalog model{activeCatalogSelectedCount === 1 ? "" : "s"} selected
+                              </p>
+                              <p className={cn("mt-0.5 text-[0.64rem]", isLight ? "text-muted-foreground" : "text-slate-300")}>
+                                Add the selection after completing provider setup.
+                              </p>
+                            </div>
+                            <div className="flex shrink-0 gap-1.5">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                className="h-7 rounded-full px-2.5 text-[0.62rem]"
+                                onClick={() => setActiveTab("catalog")}
+                              >
+                                Review
+                              </Button>
+                              <Button
+                                type="button"
+                                className="h-7 rounded-full px-2.5 text-[0.62rem]"
+                                disabled={isAddingCatalogModels}
+                                onClick={() => {
+                                  void addSelectedCatalogModels();
+                                }}
+                              >
+                                {isAddingCatalogModels ? "Adding..." : "Add selected"}
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className={cn("font-display text-[1.05rem]", isLight ? "text-foreground" : "text-white")}>
+                            {activeSetupMode === "custom-openai-compatible" ? "Custom provider" : activeDescriptor.label}
+                          </p>
+                          <p className={cn("mt-0.5 text-[0.72rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                            {activeSetupMode === "custom-openai-compatible" ? "OpenAI-compatible endpoint" : activeDescriptor.description}
+                          </p>
+                        </div>
+                        <ProviderLogo provider={activeProviderId} className="h-12 w-12 rounded-[13px]" />
+                      </div>
+
+                      <Badge
+                        className={cn(
+                          "mt-3 px-2.5 py-1 text-[0.68rem]",
+                          activeConnectionReady
+                            ? isLight ? "border-emerald-300 bg-emerald-50 text-emerald-800" : "border-emerald-300/20 bg-emerald-400/10 text-emerald-200"
+                            : isLight ? "border-amber-300 bg-amber-50 text-amber-800" : "border-amber-300/20 bg-amber-400/10 text-amber-200"
+                        )}
+                      >
+                        <span className={cn("mr-2 h-2 w-2 rounded-full", activeConnectionReady ? "bg-emerald-400" : "bg-amber-400")} />
+                        {activeConnectionLabel}
+                      </Badge>
+
+                      <div className="mt-4 space-y-4">
+                        {showProviderConnectionForm ? (
+                          <div className={cn("rounded-[24px] border p-4", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.03]")}>
+                            {activeSetupMode === "custom-openai-compatible" ? (
+                              <div className={cn("mb-3 rounded-[16px] border px-3 py-2", isLight ? "border-cyan-200 bg-cyan-50" : "border-cyan-300/20 bg-cyan-300/[0.07]")}>
+                                <p className={cn("text-[11px] font-medium", isLight ? "text-cyan-900" : "text-cyan-50")}>Custom OpenAI-compatible provider</p>
+                                <p className={cn("mt-1 max-w-[500px] text-[10px] leading-[0.98rem]", isLight ? "text-cyan-800" : "text-cyan-100/80")}>
+                                  OpenClaw stores this as an explicit provider under <code>models.providers.&lt;id&gt;</code>. Use a `/v1` base URL and an API key from your provider.
+                                </p>
+                              </div>
+                            ) : (
+                              <div className={cn("mb-3 rounded-[16px] border px-3 py-2", isLight ? "border-cyan-200 bg-cyan-50" : "border-cyan-300/20 bg-cyan-300/[0.07]")}>
+                                <p className={cn("text-[11px] font-medium", isLight ? "text-cyan-900" : "text-cyan-50")}>
+                                  Connect {activeDescriptor.shortLabel} to start discovering models.
+                                </p>
+                                <p className={cn("mt-1 max-w-[500px] text-[10px] leading-[0.98rem]", isLight ? "text-cyan-800" : "text-cyan-100/80")}>
+                                  Enter the provider API key here. Discovery will unlock after the connection is ready.
+                                </p>
+                              </div>
+                            )}
+
+                            <div className="space-y-3">
+                              {activeSetupMode === "custom-openai-compatible" ? (
+                                <div className="space-y-2">
+                                  <div>
+                                    <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                      Base URL
+                                    </label>
+                                    <Input
+                                      type="url"
+                                      value={activeDraft.endpoint}
+                                      onChange={(event) => updateDraft(activeProviderId, { endpoint: event.target.value })}
+                                      placeholder="https://api.entrim.ai/v1"
+                                      className="mt-1.5 h-8 text-[11px]"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                      Manual model ID
+                                    </label>
+                                    <Input
+                                      value={activeDraft.manualModelId}
+                                      onChange={(event) => updateDraft(activeProviderId, { manualModelId: event.target.value })}
+                                      placeholder="Optional if discovery is empty"
+                                      className="mt-1.5 h-8 text-[11px]"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                      API key
+                                    </label>
+                                    <Input
+                                      type="password"
+                                      value={activeDraft.apiKey}
+                                      onChange={(event) => updateDraft(activeProviderId, { apiKey: event.target.value })}
+                                      placeholder="Paste provider API key"
+                                      className="mt-1.5 h-8 text-[11px]"
+                                    />
+                                  </div>
+                                  <p className={cn("text-[9px] leading-[0.9rem]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                    Provider ID is inferred as {resolveCustomDraftProviderId(activeDraft) || "provider-id"} from the base URL. Models are saved as {resolveCustomDraftProviderId(activeDraft) || "provider-id"}/&lt;model&gt;.
+                                  </p>
+                                </div>
+                              ) : (
+                                <div>
+                                  <label className={cn("block text-[9px] uppercase tracking-[0.16em]", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                                    API key
+                                  </label>
+                                  <Input
+                                    type="password"
+                                    value={activeDraft.apiKey}
+                                    onChange={(event) => updateDraft(activeProviderId, { apiKey: event.target.value })}
+                                    placeholder={activeProviderId === "openrouter" ? "sk-or-v1-..." : "Paste API key"}
+                                    className="mt-1.5 h-8 text-[11px]"
+                                  />
+                                </div>
+                              )}
+
+                              <Button
+                                type="button"
+                                className="h-8 rounded-full px-3 text-[10px]"
+                                disabled={
+                                  activeDraft.flowState === "connecting" ||
+                                  !activeDraft.apiKey.trim() ||
+                                  (activeSetupMode === "custom-openai-compatible" &&
+                                    (!activeDraft.endpoint.trim() || !resolveCustomDraftProviderId(activeDraft).trim()))
+                                }
+                                onClick={() => {
+                                  if (activeSetupMode === "custom-openai-compatible") {
+                                    void connectCustomProvider();
+                                    return;
+                                  }
+
+                                  void connectProvider(activeProviderId);
+                                }}
+                              >
+                                {activeDraft.flowState === "connecting" ? (
+                                  <>
+                                    <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                                    Connecting...
+                                  </>
+                                ) : activeSetupMode === "custom-openai-compatible"
+                                  ? "Connect custom provider"
+                                  : `Connect ${activeDescriptor.shortLabel}`}
+                              </Button>
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {activeDraft.manualCommand ? (
+                          <div className={cn("rounded-[16px] border p-3", isLight ? "border-cyan-200 bg-cyan-50" : "border-cyan-300/15 bg-cyan-300/[0.07]")}>
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div>
+                                <p className={cn("text-[11px] font-medium", isLight ? "text-cyan-900" : "text-cyan-50")}>Finish setup in Terminal</p>
+                                <p className={cn("mt-1 max-w-[480px] text-[10px] leading-[0.98rem]", isLight ? "text-cyan-800" : "text-cyan-100/80")}>
+                                  Open Terminal, paste the provider API key there, then return here and check discovery.
+                                </p>
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  size="sm"
+                                  className="h-7 rounded-full px-2.5 text-[10px]"
+                                  disabled={isOpeningTerminal}
+                                  onClick={() => {
+                                    void openTerminal(activeDraft.manualCommand || "");
+                                  }}
+                                >
+                                  {isOpeningTerminal ? (
+                                    <>
+                                      <LoaderCircle className="mr-1.5 h-3 w-3 animate-spin" />
+                                      Opening...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <SquareTerminal className="mr-1.5 h-3 w-3" />
+                                      Open Terminal
+                                    </>
+                                  )}
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 rounded-full px-2.5 text-[10px]"
+                                  onClick={() => {
+                                    void copyText(activeDraft.manualCommand || "");
+                                  }}
+                                >
+                                  <Copy className="mr-1.5 h-3 w-3" />
+                                  Copy command
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 rounded-full px-2.5 text-[10px]"
+                                  onClick={() => {
+                                    void discoverProvider(activeProviderId);
+                                  }}
+                                >
+                                  <RefreshCw className="mr-1.5 h-3 w-3" />
+                                  I&apos;ve connected it
+                                </Button>
+                              </div>
+                            </div>
+                            <div className={cn("mt-2.5 overflow-x-auto rounded-[14px] border px-3 py-2", isLight ? "border-cyan-200 bg-white/70" : "border-white/10 bg-slate-950/60")}>
+                              <code className={cn("text-[10px]", isLight ? "text-foreground" : "text-slate-200")}>{activeDraft.manualCommand}</code>
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {shouldShowDiscoveryCta ? (
+                          <div
+                            className={cn(
+                              "rounded-[24px] border p-4",
+                              isLight
+                                ? "border-cyan-200 bg-[linear-gradient(180deg,rgba(255,252,248,0.98),rgba(239,249,251,0.94))] shadow-[0_18px_42px_rgba(122,91,68,0.12)]"
+                                : "border-cyan-300/20 bg-[linear-gradient(180deg,rgba(17,28,47,0.98),rgba(10,16,28,0.98))] shadow-[0_18px_42px_rgba(7,11,20,0.28)]"
+                            )}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className={cn("font-display text-[0.92rem]", isLight ? "text-foreground" : "text-white")}>
+                                  {isDiscovering ? "Discovering models..." : discoveryActionLabel}
+                                </p>
+                                <p className={cn("mt-1 max-w-[520px] text-[11px] leading-[1rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                                  {isDiscovering
+                                    ? "OpenClaw is pulling the provider catalog into this workspace."
+                                    : discoveryDescription}
+                                </p>
+                              </div>
+                              <div className="flex shrink-0 flex-wrap gap-2">
+                                <Button
+                                  type="button"
+                                  variant="default"
+                                  className="h-11 rounded-full px-5 text-[12px] font-medium"
+                                  disabled={isDiscovering}
+                                  onClick={() => {
+                                    void discoverProvider(activeProviderId);
+                                  }}
+                                >
+                                  {isDiscovering ? (
+                                    <>
+                                      <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                                      Discovering...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <RefreshCw className="mr-2 h-4 w-4" />
+                                      {discoveryButtonLabel}
+                                    </>
+                                  )}
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-11 rounded-full px-4 text-[10px]"
+                                  onClick={() => {
+                                    void runStatus(activeProviderId);
+                                  }}
+                                >
+                                  Refresh status
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {activeDraft.emptyState ? (
+                          <EmptyStateCard
+                            emptyState={activeDraft.emptyState}
+                            onCopyCommand={(command) => {
+                              void copyText(command);
+                            }}
+                            surfaceTheme={surfaceTheme}
+                          />
+                        ) : null}
+
+                        {activeDraft.models.length > 0 ? (
+                          <div>
+                            <ModelPicker
+                              provider={activeProviderId}
+                              models={activeDraft.models}
+                              selectedModelIds={activeDraft.selectedModelIds}
+                              search={activeDraft.search}
+                              onSearchChange={(value) => updateDraft(activeProviderId, { search: value })}
+                              onToggleModel={(modelId) => {
+                                const selected = activeDraft.selectedModelIds.includes(modelId);
+                                updateDraft(activeProviderId, {
+                                  selectedModelIds: selected
+                                    ? activeDraft.selectedModelIds.filter((entry) => entry !== modelId)
+                                    : [...activeDraft.selectedModelIds, modelId]
+                                });
+                              }}
+                              onAddSelected={() => {
+                                void addSelectedModels(activeProviderId);
+                              }}
+                              isAdding={
+                                activeDraft.flowState === "connecting" &&
+                                activeDraft.statusMessage === "Adding selected models..."
+                              }
+                              surfaceTheme={surfaceTheme}
+                            />
+                          </div>
+                        ) : null}
+
+                        {activeDraft.flowState === "add-success" ? (
+                          <div
+                            className={cn(
+                              "flex items-center gap-2.5 rounded-[16px] border px-3 py-2",
+                              isLight
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                                : "border-emerald-300/20 bg-emerald-300/[0.08] text-emerald-50"
+                            )}
+                          >
+                            <CircleCheckBig className={cn("h-3.5 w-3.5", isLight ? "text-emerald-700" : "text-emerald-200")} />
+                            <p className="text-[11px]">
+                              {activeDraft.statusMessage || "Models were added successfully."}
+                            </p>
+                          </div>
+                        ) : null}
+
+                        {activeDraft.docsUrl ? (
+                          <a
+                            href={activeDraft.docsUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className={cn("inline-flex text-[10px] underline underline-offset-4", isLight ? "text-primary" : "text-slate-300")}
+                          >
+                            OpenClaw model docs
+                          </a>
+                        ) : null}
+                      </div>
+
+                      <div className={cn("mt-4 border-t pt-4", isLight ? "border-border" : "border-white/10")}>
+                        <p className={cn("font-display text-[0.84rem]", isLight ? "text-foreground" : "text-white")}>Overview</p>
+                        <div className="mt-3 space-y-3">
+                          <InspectorMetric label="Models discovered" value={String(selectedProviderModelCount)} surfaceTheme={surfaceTheme} />
+                          <InspectorMetric label="Context window support" value={selectedProviderMaxContext > 0 ? `Up to ${Intl.NumberFormat().format(selectedProviderMaxContext / 1000)}k` : "Unknown"} surfaceTheme={surfaceTheme} />
+                          <InspectorMetric label="Discovery state" value={activeDraft.discoveryLoaded ? "Loaded this session" : "Not refreshed"} surfaceTheme={surfaceTheme} />
+                          <InspectorMetric label="Status" value={activeConnectionLabel} tone={activeConnectionReady ? "success" : "warning"} surfaceTheme={surfaceTheme} />
+                        </div>
+                      </div>
+
+                      <div className={cn("mt-4 border-t pt-4", isLight ? "border-border" : "border-white/10")}>
+                        <p className={cn("font-display text-[0.84rem]", isLight ? "text-foreground" : "text-white")}>Actions</p>
+                        <div className="mt-3 space-y-2">
+                          <button
+                            type="button"
+                            className={cn(
+                              "flex w-full items-center gap-2.5 rounded-[12px] border px-3 py-2.5 text-left transition",
+                              isLight
+                                ? "border-border bg-card text-foreground hover:border-primary/25 hover:bg-accent"
+                                : "border-white/10 bg-white/[0.04] hover:border-violet-300/30 hover:bg-violet-400/10"
+                            )}
+                            onClick={() => {
+                              void discoverProvider(activeProviderId, true);
+                            }}
+                            disabled={isDisconnecting}
+                          >
+                            <RefreshCw className={cn("h-4 w-4", isLight ? "text-primary" : "text-slate-300")} />
+                            <span>
+                              <span className={cn("block text-[0.78rem] font-medium", isLight ? "text-foreground" : "text-white")}>Refresh models</span>
+                              <span className={cn("block text-[0.66rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>Discover new models</span>
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            className={cn(
+                              "flex w-full items-center gap-2.5 rounded-[12px] border px-3 py-2.5 text-left transition",
+                              isLight
+                                ? "border-border bg-card text-foreground hover:border-primary/25 hover:bg-accent"
+                                : "border-white/10 bg-white/[0.04] hover:border-violet-300/30 hover:bg-violet-400/10"
+                            )}
+                            onClick={() => {
+                              void openConnectionEditor(activeProviderId);
+                            }}
+                            disabled={
+                              isDisconnecting ||
+                              activeDescriptor.connectKind === "oauth" ||
+                              activeDescriptor.connectKind === "local"
+                            }
+                            title={
+                              activeDescriptor.connectKind === "oauth" || activeDescriptor.connectKind === "local"
+                                ? "This provider connection is managed by OpenClaw."
+                                : undefined
+                            }
+                          >
+                            <Settings className={cn("h-4 w-4", isLight ? "text-primary" : "text-slate-300")} />
+                            <span>
+                              <span className={cn("block text-[0.78rem] font-medium", isLight ? "text-foreground" : "text-white")}>Manage connection</span>
+                              <span className={cn("block text-[0.66rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>API key, base URL, and settings</span>
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              activeDraft.flowState === "disconnecting" ||
+                              isLoadingDangerImpact ||
+                              activeDescriptor.connectKind === "oauth" ||
+                              activeDescriptor.connectKind === "local"
+                            }
+                            className={cn(
+                              "flex w-full items-center gap-2.5 rounded-[12px] border px-3 py-2.5 text-left transition disabled:cursor-not-allowed disabled:opacity-60",
+                              isLight
+                                ? "border-border bg-card text-foreground hover:border-amber-300 hover:bg-amber-50"
+                                : "border-white/10 bg-white/[0.04] hover:border-amber-300/30 hover:bg-amber-400/[0.08]"
+                            )}
+                            onClick={() => {
+                              void requestProviderDangerAction(activeProviderId, "disconnect-credential");
+                            }}
+                          >
+                            {activeDraft.flowState === "disconnecting" || isLoadingDangerImpact ? (
+                              <LoaderCircle className={cn("h-4 w-4 animate-spin", isLight ? "text-amber-700" : "text-amber-300")} />
+                            ) : (
+                              <KeyRound className={cn("h-4 w-4", isLight ? "text-amber-700" : "text-amber-300")} />
+                            )}
+                            <span>
+                              <span className={cn("block text-[0.78rem] font-medium", isLight ? "text-foreground" : "text-white")}>
+                                Disconnect credential
+                              </span>
+                              <span className={cn("block text-[0.66rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                                Keep configured models and remove API access
+                              </span>
+                            </span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {!isBuiltInAddModelsProviderId(activeProviderId) ? (
+                        <div className={cn("mt-4 border-t pt-4", isLight ? "border-rose-200" : "border-rose-400/20")}>
+                          <p className={cn("font-display text-[0.84rem]", isLight ? "text-rose-800" : "text-rose-200")}>Danger zone</p>
+                          <button
+                            type="button"
+                            disabled={activeDraft.flowState === "disconnecting" || isLoadingDangerImpact}
+                            className={cn(
+                              "mt-3 flex w-full items-center gap-2.5 rounded-[12px] border px-3 py-2.5 text-left transition disabled:cursor-wait disabled:opacity-70",
+                              isLight ? "border-rose-200 bg-rose-50 hover:bg-rose-100" : "border-rose-400/20 bg-rose-500/[0.07] hover:bg-rose-500/[0.12]"
+                            )}
+                            onClick={() => {
+                              void requestProviderDangerAction(activeProviderId, "delete-provider");
+                            }}
+                          >
+                            <Trash2 className={cn("h-4 w-4", isLight ? "text-rose-700" : "text-rose-300")} />
+                            <span>
+                              <span className={cn("block text-[0.78rem] font-medium", isLight ? "text-rose-800" : "text-rose-200")}>
+                                Delete custom provider
+                              </span>
+                              <span className={cn("block text-[0.66rem]", isLight ? "text-rose-700" : "text-rose-300/80")}>
+                                Remove its models, credential, and OpenClaw definition
+                              </span>
+                            </span>
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className={cn("flex h-full min-h-[260px] items-center justify-center rounded-[16px] border border-dashed text-center", isLight ? "border-border bg-muted/35" : "border-white/10")}>
+                      <div>
+                        <Database className={cn("mx-auto h-8 w-8", isLight ? "text-muted-foreground" : "text-slate-500")} />
+                        <p className={cn("mt-2 text-xs", isLight ? "text-foreground" : "text-slate-300")}>Select a provider</p>
+                        <p className={cn("mt-1 text-[11px]", isLight ? "text-muted-foreground" : "text-slate-500")}>Provider details and actions appear here.</p>
+                      </div>
+                    </div>
+                  )}
+                </aside>
+              </div>
+            </TabsContent>
+
+            <TabsContent value="catalog" className="!mt-0 m-0 flex h-full min-h-0 flex-col">
+              <div className="flex min-h-0 flex-1 flex-col space-y-2 px-3 py-3">
+                {globalCatalogError ? (
+                  <div className={cn("flex items-center justify-between gap-3 rounded-[18px] border px-4 py-3 text-[11px]", isLight ? "border-rose-200 bg-rose-50 text-rose-800" : "border-rose-400/20 bg-rose-400/[0.08] text-rose-100")}>
+                    <span>{globalCatalogError}</span>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="h-7 shrink-0 rounded-full px-3 text-[9px]"
+                      disabled={isLoadingGlobalCatalog}
+                      onClick={() => {
+                        void refreshGlobalCatalog(true);
+                      }}
+                    >
+                      Try again
+                    </Button>
+                  </div>
+                ) : null}
+
+                {globalCatalogWarning ? (
+                  <div className={cn("rounded-[16px] border px-3 py-2 text-[10px]", isLight ? "border-amber-200 bg-amber-50 text-amber-800" : "border-amber-300/20 bg-amber-300/[0.06] text-amber-100")}>
+                    <span className="font-semibold">
+                      {globalCatalogSource === "openclaw-cache" ? "Cached catalog" : globalCatalogSource === "snapshot" ? "Snapshot catalog" : "Catalog warning"}:
+                    </span>{" "}
+                    {globalCatalogWarning}
+                    {typeof globalCatalogAge === "number" && globalCatalogAge > 0 ? ` Age: ${formatCatalogAge(globalCatalogAge)}.` : ""}
+                  </div>
+                ) : null}
+
+                {globalCatalogSource ? (
+                  <div className={cn("flex flex-wrap items-center justify-between gap-2 rounded-[14px] border px-3 py-2 text-[9px]", isLight ? "border-border bg-muted/30 text-muted-foreground" : "border-white/10 bg-white/[0.03] text-slate-400")}>
+                    <span>
+                      Source:{" "}
+                      <span className={cn("font-semibold", isLight ? "text-foreground" : "text-slate-200")}>
+                        {globalCatalogSource === "openclaw"
+                          ? "Live OpenClaw catalog"
+                          : globalCatalogSource === "openclaw-cache"
+                            ? "Cached OpenClaw catalog"
+                            : "Snapshot-derived catalog"}
+                      </span>
+                    </span>
+                    <span>
+                      {typeof globalCatalogAge === "number" && globalCatalogAge > 0
+                        ? `Updated ${formatCatalogAge(globalCatalogAge)} ago`
+                        : globalCatalogCheckedAt
+                          ? `Checked ${new Date(globalCatalogCheckedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                          : "Checking OpenClaw"}
+                    </span>
+                  </div>
+                ) : null}
+
+                <GlobalModelPicker
+                  models={catalogModels}
+                  selectedModelIds={catalogSelectedModelIds}
+                  search={catalogSearch}
+                  onSearchChange={setCatalogSearch}
+                  onToggleModel={(providerId, modelId) => {
+                    const currentDraft = resolveDraft(providerDrafts[providerId]);
+                    const wasSelected = currentDraft.selectedModelIds.includes(modelId);
+                    updateDraft(providerId, {
+                      selectedModelIds: wasSelected
+                        ? currentDraft.selectedModelIds.filter((entry) => entry !== modelId)
+                        : [...currentDraft.selectedModelIds, modelId]
+                    });
+
+                    if (!wasSelected && isAddModelsProviderId(providerId)) {
+                      void selectProvider(providerId, { scrollToSettings: true });
+                    }
+                  }}
+                  onAddSelected={() => {
+                    void addSelectedCatalogModels();
+                  }}
+                  onClearSelected={clearCatalogSelection}
+                  onOpenProviders={(providerId) => {
+                    setActiveTab("providers");
+
+                    if (isAddModelsProviderId(providerId)) {
+                      void selectProvider(providerId, { scrollToSettings: true });
+                    }
+                  }}
+                  onLoadMore={() => setCatalogVisibleCount((current) => current + CATALOG_PAGE_SIZE)}
+                  visibleModelCount={catalogVisibleCount}
+                  isAdding={isAddingCatalogModels}
+                  isLoading={isLoadingGlobalCatalog && catalogModels.length === 0}
+                  surfaceTheme={surfaceTheme}
+                />
+
+                {!isLoadingGlobalCatalog && catalogModels.length === 0 && !globalCatalogError ? (
+                  <div className={cn("rounded-[18px] border border-dashed px-4 py-5 text-center text-[11px]", isLight ? "border-border bg-muted/35 text-muted-foreground" : "border-white/10 bg-white/[0.02] text-slate-400")}>
+                    OpenClaw did not return any supported models yet. Check your installation or refresh providers.
+                  </div>
+                ) : null}
+              </div>
+            </TabsContent>
+          </div>
+        </Tabs>
+        <Dialog
+          open={connectionEditorOpen}
+          onOpenChange={(nextOpen) => {
+            if (!isSavingConnection) {
+              setConnectionEditorOpen(nextOpen);
+              if (!nextOpen) {
+                setConnectionEditorCredential("");
+              }
+            }
+          }}
+        >
+          <DialogContent
+            className={cn(
+              "flex h-dvh max-h-dvh w-screen max-w-none flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:h-auto sm:max-h-[86dvh] sm:w-[min(92vw,560px)] sm:max-w-[560px] sm:rounded-[22px] sm:border",
+              isLight
+                ? "border-border bg-card text-card-foreground shadow-[0_30px_90px_rgba(63,47,34,0.18)]"
+                : "border-white/10 bg-[#090d17] text-white shadow-[0_30px_90px_rgba(0,0,0,0.58)]"
+            )}
+          >
+            <DialogHeader className={cn("shrink-0 border-b px-5 py-4 text-left", isLight ? "border-border" : "border-white/10")}>
+              <DialogTitle className="font-display text-[1.05rem]">Connection settings</DialogTitle>
+              <DialogDescription className={cn("mt-1 text-[0.76rem] leading-5", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                Edit the OpenClaw provider overlay or replace its stored credential.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              <div className="space-y-4">
+                <div>
+                  <label className={cn("text-[0.68rem] font-medium", isLight ? "text-foreground" : "text-slate-200")}>Provider ID</label>
+                  <Input
+                    value={activeProviderId ?? ""}
+                    readOnly
+                    className="mt-1.5 h-9 font-mono text-[0.72rem]"
+                  />
+                  <p className={cn("mt-1.5 text-[0.66rem] leading-4", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                    Provider IDs are immutable because OpenClaw model references use this namespace.
+                  </p>
+                </div>
+
+                <div>
+                  <label className={cn("text-[0.68rem] font-medium", isLight ? "text-foreground" : "text-slate-200")}>Base URL</label>
+                  <Input
+                    type="url"
+                    value={connectionEditorEndpoint}
+                    onChange={(event) => setConnectionEditorEndpoint(event.target.value)}
+                    placeholder={
+                      activeDraft.providerConfig?.kind === "custom"
+                        ? "https://provider.example/v1"
+                        : "Use OpenClaw default"
+                    }
+                    className="mt-1.5 h-9 text-[0.72rem]"
+                  />
+                  <p className={cn("mt-1.5 text-[0.66rem] leading-4", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                    {activeDraft.providerConfig?.kind === "custom"
+                      ? "Custom providers require a valid HTTP or HTTPS endpoint."
+                      : "Leave blank to remove the override and use OpenClaw's bundled endpoint."}
+                  </p>
+                </div>
+
+                {activeDraft.providerConfig?.kind === "custom" ? (
+                  <div>
+                    <label className={cn("text-[0.68rem] font-medium", isLight ? "text-foreground" : "text-slate-200")}>API mode</label>
+                    <select
+                      value={connectionEditorApi}
+                      onChange={(event) => setConnectionEditorApi(event.target.value)}
+                      className={cn(
+                        "mt-1.5 h-9 w-full rounded-md border px-3 text-[0.72rem] outline-none focus:ring-2 focus:ring-violet-500/30",
+                        isLight ? "border-border bg-background text-foreground" : "border-white/10 bg-slate-950 text-white"
+                      )}
+                    >
+                      <option value="openai-completions">OpenAI Completions</option>
+                      <option value="openai-responses">OpenAI Responses</option>
+                      <option value="anthropic-messages">Anthropic Messages</option>
+                      <option value="google-generative-ai">Google Generative AI</option>
+                    </select>
+                  </div>
+                ) : (
+                  <div className={cn("rounded-md border px-3 py-2.5", isLight ? "border-border bg-muted/40" : "border-white/10 bg-white/[0.03]")}>
+                    <p className={cn("text-[0.68rem] font-medium", isLight ? "text-foreground" : "text-slate-200")}>Bundled API mode</p>
+                    <p className={cn("mt-1 text-[0.66rem] leading-4", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                      OpenClaw owns the transport mode for bundled providers.
+                    </p>
+                  </div>
+                )}
+
+                <div className={cn("rounded-md border p-3", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.03]")}>
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className={cn("text-[0.7rem] font-medium", isLight ? "text-foreground" : "text-white")}>Credential</p>
+                      <p className={cn("mt-0.5 text-[0.64rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                        {activeDraft.providerConfig?.credentialConfigured ? "Configured in OpenClaw" : "Not configured"}
+                      </p>
+                    </div>
+                    <Badge variant={activeDraft.providerConfig?.credentialConfigured ? "success" : "muted"}>
+                      {activeDraft.providerConfig?.credentialConfigured ? "Configured" : "Missing"}
+                    </Badge>
+                  </div>
+                  <Input
+                    type="password"
+                    value={connectionEditorCredential}
+                    onChange={(event) => setConnectionEditorCredential(event.target.value)}
+                    placeholder="Leave blank to keep the current credential"
+                    className="mt-3 h-9 text-[0.72rem]"
+                    autoComplete="new-password"
+                  />
+                  <p className={cn("mt-1.5 text-[0.64rem] leading-4", isLight ? "text-muted-foreground" : "text-slate-500")}>
+                    AgentOS never reads the stored value back. Entering a new key replaces it.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <DialogFooter className={cn("shrink-0 flex-row border-t px-5 py-4", isLight ? "border-border" : "border-white/10")}>
+              <Button
+                type="button"
+                variant="secondary"
+                className="flex-1 sm:flex-none"
+                disabled={isSavingConnection}
+                onClick={() => setConnectionEditorOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                className="flex-1 sm:flex-none"
+                disabled={
+                  isSavingConnection ||
+                  (activeDraft.providerConfig?.kind === "custom" && !connectionEditorEndpoint.trim())
+                }
+                onClick={() => {
+                  void saveConnectionEditor();
+                }}
+              >
+                {isSavingConnection ? (
+                  <>
+                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  "Save connection"
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog
+          open={dangerAction !== null}
+          onOpenChange={(nextOpen) => {
+            if (!nextOpen && !isApplyingDangerAction) {
+              setDangerAction(null);
+            }
+          }}
+        >
+          <DialogContent
+            className={cn(
+              "w-[min(94vw,520px)] rounded-[20px] p-0",
+              isLight
+                ? "border-rose-200 bg-card text-card-foreground shadow-[0_30px_90px_rgba(63,47,34,0.18)]"
+                : "border-rose-400/20 bg-[#0b0d15] text-white shadow-[0_30px_90px_rgba(0,0,0,0.58)]"
+            )}
+          >
+            <DialogHeader className={cn("border-b px-5 py-4 text-left", isLight ? "border-rose-200" : "border-rose-400/20")}>
+              <div className="flex items-start gap-3">
+                <span className={cn("mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md", isLight ? "bg-rose-100 text-rose-700" : "bg-rose-500/10 text-rose-300")}>
+                  <AlertTriangle className="h-4 w-4" />
+                </span>
+                <div>
+                  <DialogTitle className="font-display text-[1rem]">
+                    {dangerAction?.kind === "delete-provider" ? "Delete custom provider?" : "Disconnect provider credential?"}
+                  </DialogTitle>
+                  <DialogDescription className={cn("mt-1 text-[0.72rem] leading-5", isLight ? "text-muted-foreground" : "text-slate-400")}>
+                    Review the OpenClaw impact before applying this change.
+                  </DialogDescription>
+                </div>
+              </div>
+            </DialogHeader>
+
+            {dangerAction ? (
+              <div className="space-y-3 px-5 py-4 text-[0.72rem]">
+                <ImpactRow
+                  label="Configured models"
+                  value={
+                    dangerAction.kind === "delete-provider"
+                      ? `${dangerAction.impact.providerModelIds.length} will be removed`
+                      : `${dangerAction.impact.providerModelIds.length} will be kept`
+                  }
+                  surfaceTheme={surfaceTheme}
+                />
+                <ImpactRow
+                  label="Affected agents"
+                  value={
+                    dangerAction.impact.affectedAgents.length > 0
+                      ? dangerAction.impact.replacementModelId
+                        ? `${dangerAction.impact.affectedAgents.length} will move to ${dangerAction.impact.replacementModelId}`
+                        : `${dangerAction.impact.affectedAgents.length} affected; no replacement available`
+                      : "None"
+                  }
+                  surfaceTheme={surfaceTheme}
+                />
+                <ImpactRow
+                  label="Global default"
+                  value={
+                    dangerAction.impact.defaultModelAffected
+                      ? dangerAction.impact.replacementModelId
+                        ? `Moves to ${dangerAction.impact.replacementModelId}`
+                        : "No replacement available"
+                      : "Unchanged"
+                  }
+                  surfaceTheme={surfaceTheme}
+                />
+                <ImpactRow
+                  label="Credential"
+                  value={
+                    dangerAction.impact.credentialCleanup === "removed"
+                      ? "Removed from OpenClaw config"
+                      : dangerAction.impact.credentialCleanup === "not-required"
+                        ? "Not applicable"
+                        : "Removal unsupported"
+                  }
+                  surfaceTheme={surfaceTheme}
+                />
+                {dangerAction.impact.blockedReason ? (
+                  <div className={cn("rounded-md border px-3 py-2", isLight ? "border-rose-200 bg-rose-50 text-rose-800" : "border-rose-400/20 bg-rose-500/[0.08] text-rose-200")}>
+                    {dangerAction.impact.blockedReason}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            <DialogFooter className={cn("flex-row border-t px-5 py-4", isLight ? "border-border" : "border-white/10")}>
+              <Button
+                type="button"
+                variant="secondary"
+                className="flex-1 sm:flex-none"
+                disabled={isApplyingDangerAction}
+                onClick={() => setDangerAction(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                className="flex-1 sm:flex-none"
+                disabled={isApplyingDangerAction || Boolean(dangerAction?.impact.blockedReason)}
+                onClick={() => {
+                  void applyProviderDangerAction();
+                }}
+              >
+                {isApplyingDangerAction ? (
+                  <>
+                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                    Applying...
+                  </>
+                ) : dangerAction?.kind === "delete-provider" ? (
+                  "Delete provider"
+                ) : (
+                  "Disconnect credential"
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function EmptyStateCard({
+  emptyState,
+  onCopyCommand,
+  surfaceTheme = "dark"
+}: {
+  emptyState: AddModelsEmptyState;
+  onCopyCommand: (command: string) => void;
+  surfaceTheme?: "dark" | "light";
+}) {
+  const isLight = surfaceTheme === "light";
+
+  return (
+    <div className={cn("mt-3 rounded-[20px] border p-3", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.03]")}>
+      <p className={cn("font-display text-[0.88rem]", isLight ? "text-foreground" : "text-white")}>{emptyState.title}</p>
+      <p className={cn("mt-1 max-w-[520px] text-[11px] leading-[0.98rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>{emptyState.description}</p>
+
+      {emptyState.commands?.length ? (
+        <div className="mt-3 space-y-1.5">
+          {emptyState.commands.map((command) => (
+            <div
+              key={command}
+              className={cn("flex flex-wrap items-center justify-between gap-2 rounded-[14px] border px-3 py-2", isLight ? "border-border bg-card" : "border-white/10 bg-slate-950/60")}
+            >
+              <code className={cn("text-[10px]", isLight ? "text-foreground" : "text-slate-200")}>{command}</code>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-7 rounded-full px-2.5 text-[10px]"
+                onClick={() => onCopyCommand(command)}
+              >
+                <Copy className="mr-1.5 h-3 w-3" />
+                Copy
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function InspectorMetric({
+  label,
+  value,
+  tone = "default",
+  surfaceTheme = "dark"
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "success" | "warning";
+  surfaceTheme?: "dark" | "light";
+}) {
+  const isLight = surfaceTheme === "light";
+
+  return (
+    <div className="flex items-center justify-between gap-3 text-[0.82rem]">
+      <span className={cn(isLight ? "text-muted-foreground" : "text-slate-400")}>{label}</span>
+      <span
+        className={cn(
+          "text-right font-medium",
+          tone === "success"
+            ? isLight ? "text-emerald-700" : "text-emerald-300"
+            : tone === "warning"
+              ? isLight ? "text-amber-800" : "text-amber-300"
+              : isLight ? "text-foreground" : "text-slate-100"
+        )}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function resolveDraft(draft?: ProviderDraft): ProviderDraft {
+  return draft ? { ...initialDraftState(), ...draft } : initialDraftState();
+}
+
+function ImpactRow({
+  label,
+  value,
+  surfaceTheme
+}: {
+  label: string;
+  value: string;
+  surfaceTheme: "dark" | "light";
+}) {
+  const isLight = surfaceTheme === "light";
+
+  return (
+    <div className={cn("flex items-start justify-between gap-4 rounded-md border px-3 py-2.5", isLight ? "border-border bg-muted/35" : "border-white/10 bg-white/[0.03]")}>
+      <span className={cn("text-[0.68rem]", isLight ? "text-muted-foreground" : "text-slate-400")}>{label}</span>
+      <span className={cn("max-w-[65%] text-right text-[0.7rem] font-medium", isLight ? "text-foreground" : "text-slate-100")}>{value}</span>
+    </div>
+  );
+}
+
+function resolveCustomDraftProviderId(draft: ProviderDraft) {
+  const explicitProviderId = normalizeExplicitProviderId(draft.providerId);
+
+  if (explicitProviderId) {
+    return explicitProviderId;
+  }
+
+  const inferredProviderId = inferProviderIdFromBaseUrl(draft.endpoint);
+
+  if (!inferredProviderId) {
+    return "";
+  }
+
+  return isBuiltInAddModelsProviderId(inferredProviderId)
+    ? `${inferredProviderId}-custom`
+    : inferredProviderId;
+}
+
+function inferProviderIdFromBaseUrl(endpoint: string) {
+  const trimmed = endpoint.trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const hostname = new URL(trimmed).hostname.toLowerCase();
+    const hostnameParts = hostname.split(".").filter(Boolean);
+    const meaningfulParts = hostnameParts.filter((part) => !["api", "gateway", "llm", "models"].includes(part));
+    const providerCandidate = meaningfulParts.length >= 2
+      ? meaningfulParts[meaningfulParts.length - 2]
+      : meaningfulParts[0] ?? hostnameParts[0] ?? "";
+
+    return normalizeExplicitProviderId(providerCandidate || hostname);
+  } catch {
+    return normalizeExplicitProviderId(trimmed);
+  }
+}
+
+function resolveCustomEndpointDetail(endpoint?: string) {
+  const trimmed = endpoint?.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    return `Custom endpoint: ${url.origin}${url.pathname.replace(/\/$/, "")}`;
+  } catch {
+    return `Custom endpoint: ${trimmed}`;
+  }
+}
+
+function resolveConnectionDetail(
+  snapshot: MissionControlSnapshot,
+  drafts: Partial<Record<string, ProviderDraft>>,
+  providerId: AddModelsProviderId
+): AddModelsProviderConnectionStatus {
+  const cachedConnection = drafts[providerId]?.connection;
+
+  if (cachedConnection) {
+    return cachedConnection;
+  }
+
+  const readinessProvider = snapshot.diagnostics.modelReadiness.authProviders.find(
+    (provider) => provider.provider === providerId
+  );
+  const providerModels = snapshot.models.filter((model) => modelMatchesProvider(providerId, model.id, model.provider));
+  const localModelCount = providerModels.length;
+
+  if (providerId === "ollama") {
+    return {
+      provider: providerId,
+      connected: localModelCount > 0,
+      canConnect: true,
+      needsTerminal: false,
+      source: "local-runtime",
+      degraded: true,
+      stale: false,
+      recovery: "Refresh through OpenClaw model discovery when Gateway catalog support is available.",
+      detail:
+        localModelCount > 0
+          ? `${localModelCount} model${localModelCount === 1 ? "" : "s"} already visible in AgentOS.`
+          : "Detect local models from this machine."
+    };
+  }
+
+  if (!isBuiltInAddModelsProviderId(providerId) && localModelCount > 0) {
+    const hasAvailableModel = providerModels.some((model) => !model.missing && model.available !== false);
+
+    return {
+      provider: providerId,
+      connected: hasAvailableModel,
+      canConnect: true,
+      needsTerminal: false,
+      source: "openclaw-config",
+      degraded: !hasAvailableModel,
+      stale: false,
+      recovery: hasAvailableModel ? null : "Reconnect this provider or add a ready model before assigning it.",
+      detail: hasAvailableModel
+        ? `${localModelCount} configured model${localModelCount === 1 ? "" : "s"} available through OpenClaw.`
+        : `${localModelCount} configured model${localModelCount === 1 ? "" : "s"} need provider recovery.`
+    };
+  }
+
+  const connected = Boolean(readinessProvider?.connected);
+  const descriptor = getModelProviderDescriptor(providerId);
+
+  return {
+    provider: providerId,
+    authMethod: readinessProvider?.authMethod ?? null,
+    availableAuthMethods: readinessProvider?.availableAuthMethods ?? (
+      descriptor.authMethods
+        ? [...descriptor.authMethods]
+        : undefined
+    ),
+    connected,
+    canConnect: true,
+    needsTerminal: false,
+    source: readinessProvider ? "gateway" : "openclaw-config",
+    degraded: !connected && localModelCount > 0,
+    stale: false,
+    recovery: connected ? null : `Connect ${descriptor.shortLabel} through OpenClaw, then refresh discovery.`,
+    detail: connected
+      ? readinessProvider?.detail || descriptor.helperText
+      : localModelCount > 0
+        ? `${localModelCount} model${localModelCount === 1 ? "" : "s"} are already saved in AgentOS. Connect ${descriptor.shortLabel} to use them.`
+        : descriptor.helperText
+  };
+}
+
+function getProviderSortRank(providerId: AddModelsProviderId, connected: boolean) {
+  if (connected) {
+    return 0;
+  }
+
+  if (providerId === "ollama") {
+    return 1;
+  }
+
+  return 2;
+}
+
+function formatCatalogAge(ageMs: number) {
+  if (ageMs < 60_000) {
+    return `${Math.max(1, Math.round(ageMs / 1000))}s`;
+  }
+
+  if (ageMs < 3_600_000) {
+    return `${Math.round(ageMs / 60_000)}m`;
+  }
+
+  return `${Math.round(ageMs / 3_600_000)}h`;
+}
+
+function isProviderConnectionReady(connection: AddModelsProviderConnectionStatus | null | undefined) {
+  if (!connection?.connected) {
+    return false;
+  }
+
+  return !connection.degraded &&
+    !connection.stale &&
+    (connection.source === "gateway" || connection.source === "openclaw-config");
+}
+
+function resolveProviderConnectionLabel(
+  connection: AddModelsProviderConnectionStatus | null | undefined,
+  connectKind?: string
+) {
+  if (!connection) {
+    return "Unknown";
+  }
+
+  if (connection.source === "agentos-sidecar") {
+    return "Disconnected in AgentOS";
+  }
+
+  if (connection.stale) {
+    return "Cached";
+  }
+
+  if (connection.degraded) {
+    return connection.connected ? "Degraded" : "Needs reconnect";
+  }
+
+  if (connection.verification === "credential-stored") {
+    if (connection.authMethod === "chatgpt-oauth") {
+      return "ChatGPT connected";
+    }
+
+    return "Credential stored";
+  }
+
+  if (connection.verification === "verified") {
+    return "Verified";
+  }
+
+  if (isProviderConnectionReady(connection)) {
+    return "Connected";
+  }
+
+  return connectKind === "local" ? "Detected" : "Not connected";
+}
+
+function modelMatchesProvider(providerId: AddModelsProviderId, modelId: string, modelProvider?: string | null) {
+  return modelMatchesAddModelsProvider(providerId, modelId, modelProvider);
+}
+
+function buildProgressSteps(
+  providerId: AddModelsProviderId,
+  draft: ProviderDraft,
+  connection: AddModelsProviderConnectionStatus | null
+) {
+  const connectDone =
+    providerId === "ollama"
+      ? Boolean(connection?.connected || draft.emptyState)
+      : Boolean(connection?.connected || draft.manualCommand);
+  const discoverDone = draft.models.length > 0 || Boolean(draft.emptyState);
+  const selectDone = draft.selectedModelIds.length > 0;
+  const addDone = draft.flowState === "add-success";
+
+  return [
+    { label: "Choose provider", status: "done" },
+    {
+      label: providerId === "ollama" ? "Local check" : "Connect",
+      status: draft.flowState === "connecting" && !connectDone ? "active" : connectDone ? "done" : "pending"
+    },
+    {
+      label: "Discover",
+      status: draft.flowState === "discovery-loading" ? "active" : discoverDone ? "done" : "pending"
+    },
+    {
+      label: "Select",
+      status: addDone ? "done" : selectDone ? "active" : "pending"
+    },
+    {
+      label: "Add",
+      status: addDone ? "done" : draft.flowState === "add-error" ? "active" : "pending"
+    }
+  ] as const;
+}

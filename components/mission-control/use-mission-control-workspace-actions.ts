@@ -1,0 +1,353 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+
+import type { ConnectBrowserProfileInput } from "@/components/operations/accounts/accounts-page-content";
+import {
+  prepareSecureBrowserPopup,
+  startSecureLiveView,
+  type SecureBrowserAccountView,
+  type SecureBrowserCapabilityView,
+  type SecureBrowserConnectInput
+} from "@/components/operations/accounts/secure-browser-connect-client";
+import { toast } from "@/components/ui/sonner";
+import type {
+  AccountAccessRulesResponse,
+  AccountAccessRuleView
+} from "@/lib/agentos/account-access-policy-types";
+import type {
+  AccountLoginTargetsResponse,
+  AccountLoginTargetView
+} from "@/lib/agentos/account-login-target-types";
+import type { MissionControlSnapshot } from "@/lib/agentos/contracts";
+import type {
+  OpenClawBrowserProfileMutationResponse,
+  OpenClawBrowserProfilesResponse,
+  OpenClawBrowserProfileView
+} from "@/lib/openclaw/browser-profile-types";
+
+type WorkspaceRecord = MissionControlSnapshot["workspaces"][number];
+
+export function useMissionControlWorkspaceActions({
+  activeWorkspace,
+  openWorkspaceOnCanvas
+}: {
+  activeWorkspace: WorkspaceRecord | null;
+  openWorkspaceOnCanvas: (workspaceId: string | null) => void;
+}) {
+  const [isWorkspaceWizardOpen, setIsWorkspaceWizardOpen] = useState(false);
+  const [workspaceWizardInitialMode, setWorkspaceWizardInitialMode] = useState<"basic" | "advanced">("basic");
+  const [workspaceWizardEditId, setWorkspaceWizardEditId] = useState<string | null>(null);
+  const [isWorkspaceAccountsOpen, setIsWorkspaceAccountsOpen] = useState(false);
+  const [workspaceAccountsInitialAgentId, setWorkspaceAccountsInitialAgentId] = useState<string | null>(null);
+  const [isAgentConnectionsOpen, setIsAgentConnectionsOpen] = useState(false);
+  const [agentConnectionsInitialAgentId, setAgentConnectionsInitialAgentId] = useState<string | null>(null);
+  const [agentConnectionsInitialProviderId, setAgentConnectionsInitialProviderId] = useState<string | null>(null);
+  const [isConnectAccountDialogOpen, setIsConnectAccountDialogOpen] = useState(false);
+  const [accountBrowserProfiles, setAccountBrowserProfiles] = useState<OpenClawBrowserProfileView[]>([]);
+  const [accountBrowserProfilesError, setAccountBrowserProfilesError] = useState<string | null>(null);
+  const [accountBrowserProfileRecoveryBusy, setAccountBrowserProfileRecoveryBusy] = useState<"restart" | null>(null);
+  const [accountSecureBrowserCapabilities, setAccountSecureBrowserCapabilities] =
+    useState<SecureBrowserCapabilityView | null>(null);
+  const [accountTargets, setAccountTargets] = useState<AccountLoginTargetView[]>([]);
+  const [accountAccessRules, setAccountAccessRules] = useState<AccountAccessRuleView[]>([]);
+
+  const openWorkspaceWizard = useCallback((mode: "basic" | "advanced" = "basic") => {
+    setWorkspaceWizardEditId(null);
+    setWorkspaceWizardInitialMode(mode);
+    setIsWorkspaceWizardOpen(true);
+  }, []);
+
+  const openWorkspaceWizardForEdit = useCallback((workspaceId: string) => {
+    setWorkspaceWizardEditId(workspaceId);
+    setWorkspaceWizardInitialMode("advanced");
+    setIsWorkspaceWizardOpen(true);
+  }, []);
+
+  const handleWorkspaceWizardOpenChange = useCallback((nextOpen: boolean) => {
+    setIsWorkspaceWizardOpen(nextOpen);
+
+    if (!nextOpen) {
+      setWorkspaceWizardEditId(null);
+      setWorkspaceWizardInitialMode("basic");
+    }
+  }, []);
+
+  const loadAccountBindings = useCallback(async () => {
+    try {
+      const [targetsResponse, rulesResponse] = await Promise.all([
+        fetch("/api/accounts/login-targets", { cache: "no-store" }),
+        fetch("/api/accounts/access-rules", { cache: "no-store" })
+      ]);
+      const targetsPayload = await targetsResponse.json().catch(() => null) as AccountLoginTargetsResponse | null;
+      const rulesPayload = await rulesResponse.json().catch(() => null) as AccountAccessRulesResponse | null;
+
+      if (targetsResponse.ok && targetsPayload?.ok) {
+        setAccountTargets(targetsPayload.targets);
+      }
+
+      if (rulesResponse.ok && rulesPayload?.ok) {
+        setAccountAccessRules(rulesPayload.rules);
+      }
+    } catch {
+      setAccountTargets([]);
+      setAccountAccessRules([]);
+    }
+  }, []);
+
+  const loadAccountBrowserProfiles = useCallback(async () => {
+    try {
+      const response = await fetch("/api/accounts/browser-profiles", { cache: "no-store" });
+      const payload = await response.json().catch(() => null) as OpenClawBrowserProfilesResponse | null;
+
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.error ?? "Unable to read OpenClaw browser profiles.");
+      }
+
+      setAccountBrowserProfiles(payload.profiles);
+      setAccountBrowserProfilesError(null);
+    } catch (error) {
+      setAccountBrowserProfiles([]);
+      setAccountBrowserProfilesError(readBrowserProfileError(error, "OpenClaw did not return browser profiles."));
+    }
+  }, []);
+
+  const loadAccountSecureBrowserCapabilities = useCallback(async () => {
+    if (!activeWorkspace) {
+      setAccountSecureBrowserCapabilities(null);
+      return;
+    }
+    try {
+      const response = await fetch(
+        `/api/accounts/browser-accounts?workspaceId=${encodeURIComponent(activeWorkspace.id)}`,
+        { cache: "no-store" }
+      );
+      const payload = await response.json().catch(() => null) as {
+        capabilities?: SecureBrowserCapabilityView;
+        error?: string;
+      } | null;
+      if (!response.ok) {
+        throw new Error(payload?.error ?? "Unable to read Secure Browser capabilities.");
+      }
+      setAccountSecureBrowserCapabilities(payload?.capabilities ?? null);
+    } catch {
+      setAccountSecureBrowserCapabilities(null);
+    }
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    void loadAccountSecureBrowserCapabilities();
+  }, [loadAccountSecureBrowserCapabilities]);
+
+  useEffect(() => {
+    void loadAccountBindings();
+  }, [loadAccountBindings]);
+
+  const openAgentConnections = useCallback((workspaceId?: string, agentId?: string, provider?: string) => {
+    if (workspaceId) {
+      openWorkspaceOnCanvas(workspaceId);
+    }
+
+    setAgentConnectionsInitialAgentId(agentId ?? null);
+    setAgentConnectionsInitialProviderId(provider ?? null);
+    setIsAgentConnectionsOpen(true);
+  }, [openWorkspaceOnCanvas]);
+
+  const openAccountsConnect = useCallback((workspaceId?: string, agentId?: string) => {
+    if (workspaceId) {
+      openWorkspaceOnCanvas(workspaceId);
+    }
+
+    setWorkspaceAccountsInitialAgentId(agentId ?? null);
+    setIsWorkspaceAccountsOpen(true);
+    void loadAccountBindings();
+  }, [loadAccountBindings, openWorkspaceOnCanvas]);
+
+  const openConnectAccountDialog = useCallback(() => {
+    setIsConnectAccountDialogOpen(true);
+    setAccountBrowserProfilesError(null);
+    void loadAccountBrowserProfiles();
+    void loadAccountSecureBrowserCapabilities();
+  }, [loadAccountBrowserProfiles, loadAccountSecureBrowserCapabilities]);
+
+  const restartGatewayForAccountProfiles = useCallback(async () => {
+    setAccountBrowserProfileRecoveryBusy("restart");
+
+    try {
+      const response = await fetch("/api/gateway/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "restart" })
+      });
+      const payload = await response.json().catch(() => null) as { message?: string; error?: string } | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? "Unable to restart the OpenClaw Gateway.");
+      }
+
+      toast.success(payload?.message ?? "Gateway restart requested.", {
+        description: "Retrying browser profile discovery after the Gateway restart."
+      });
+      await loadAccountBrowserProfiles();
+    } catch (error) {
+      toast.error("Gateway restart did not complete.", {
+        description: readBrowserProfileError(error, "Open diagnostics to inspect the OpenClaw Gateway state.")
+      });
+    } finally {
+      setAccountBrowserProfileRecoveryBusy(null);
+    }
+  }, [loadAccountBrowserProfiles]);
+
+  const connectAccount = useCallback(async (input: ConnectBrowserProfileInput) => {
+    if (!activeWorkspace) {
+      toast.error("Select a workspace before connecting an account.");
+      return;
+    }
+
+    try {
+      const profileResponse = await fetch("/api/accounts/browser-profiles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "open-login",
+          profileName: input.profileName,
+          loginUrl: input.loginUrl,
+          label: input.label
+        })
+      });
+      const profilePayload = await profileResponse.json().catch(() => null) as OpenClawBrowserProfileMutationResponse | null;
+
+      if (!profileResponse.ok || !profilePayload?.ok) {
+        throw new Error(profilePayload?.error ?? "Unable to open the login URL in OpenClaw.");
+      }
+
+      const targetResponse = await fetch("/api/accounts/login-targets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workspaceId: activeWorkspace.id,
+          workspaceName: activeWorkspace.name,
+          workspacePath: activeWorkspace.path ?? null,
+          serviceId: input.serviceId,
+          serviceName: input.serviceName,
+          primaryDomain: input.primaryDomain,
+          loginUrl: input.loginUrl,
+          browserProfileName: input.profileName
+        })
+      });
+      const targetPayload = await targetResponse.json().catch(() => null) as AccountLoginTargetsResponse | null;
+
+      if (!targetResponse.ok || !targetPayload?.ok) {
+        throw new Error(targetPayload?.error ?? "Unable to save account login target.");
+      }
+
+      setAccountTargets(targetPayload.targets);
+      toast.success("Login browser opened.", {
+        description: "Complete the login in the OpenClaw browser profile. AgentOS saved only the login target."
+      });
+      setIsConnectAccountDialogOpen(false);
+      await Promise.all([loadAccountBindings(), loadAccountBrowserProfiles()]);
+    } catch (error) {
+      toast.error("Connect Account did not complete.", {
+        description: readBrowserProfileError(error, "Unable to open the login browser.")
+      });
+    }
+  }, [activeWorkspace, loadAccountBindings, loadAccountBrowserProfiles]);
+
+  const connectSecureBrowserAccount = useCallback(async (input: SecureBrowserConnectInput) => {
+    if (!activeWorkspace) {
+      toast.error("Select a workspace before connecting an account.");
+      return;
+    }
+    const popup = window.open("about:blank", "agentos-secure-browser");
+    if (!popup) {
+      toast.error("Allow pop-ups to open Secure Browser Live View.");
+      return;
+    }
+    prepareSecureBrowserPopup(popup);
+    try {
+      const createResponse = await fetch("/api/accounts/browser-accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "create",
+          workspaceId: activeWorkspace.id,
+          serviceName: input.serviceName,
+          primaryDomain: input.primaryDomain,
+          allowedDomains: [input.primaryDomain],
+          allowedAgentIds: input.allowedAgentIds
+        })
+      });
+      const createPayload = await createResponse.json().catch(() => null) as {
+        result?: { account?: SecureBrowserAccountView };
+        error?: string;
+      } | null;
+      const account = createPayload?.result?.account;
+      if (!createResponse.ok || !account) {
+        throw new Error(
+          createPayload?.error ?? "Unable to create the secure browser profile."
+        );
+      }
+
+      const launchUrl = await startSecureLiveView(account.id, account.workspaceId);
+      popup.location.replace(launchUrl);
+      setIsConnectAccountDialogOpen(false);
+      toast.success("Secure Browser opened.", {
+        description: "Your password and verification codes stay inside the isolated browser session."
+      });
+      await loadAccountBindings();
+    } catch (error) {
+      popup.close();
+      toast.error("Connect Browser Account did not complete.", {
+        description: readBrowserProfileError(
+          error,
+          "Unable to start Secure Browser Live View."
+        )
+      });
+    }
+  }, [activeWorkspace, loadAccountBindings]);
+
+  return {
+    isWorkspaceWizardOpen,
+    workspaceWizardInitialMode,
+    workspaceWizardEditId,
+    openWorkspaceWizard,
+    openWorkspaceWizardForEdit,
+    handleWorkspaceWizardOpenChange,
+    isWorkspaceAccountsOpen,
+    setIsWorkspaceAccountsOpen,
+    workspaceAccountsInitialAgentId,
+    setWorkspaceAccountsInitialAgentId,
+    isAgentConnectionsOpen,
+    setIsAgentConnectionsOpen,
+    agentConnectionsInitialAgentId,
+    setAgentConnectionsInitialAgentId,
+    agentConnectionsInitialProviderId,
+    setAgentConnectionsInitialProviderId,
+    openAgentConnections,
+    openAccountsConnect,
+    isConnectAccountDialogOpen,
+    setIsConnectAccountDialogOpen,
+    accountBrowserProfiles,
+    accountBrowserProfilesError,
+    accountBrowserProfileRecoveryBusy,
+    accountSecureBrowserCapabilities,
+    accountTargets,
+    setAccountTargets,
+    accountAccessRules,
+    setAccountAccessRules,
+    loadAccountBrowserProfiles,
+    openConnectAccountDialog,
+    restartGatewayForAccountProfiles,
+    connectAccount,
+    connectSecureBrowserAccount
+  };
+}
+
+function readBrowserProfileError(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  return fallback;
+}

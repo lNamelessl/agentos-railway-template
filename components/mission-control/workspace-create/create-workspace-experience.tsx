@@ -1,0 +1,2175 @@
+"use client";
+
+import {
+  Bot,
+  Check,
+  ChevronLeft,
+  CircleAlert,
+  FileText,
+  FolderOpen,
+  Github,
+  Globe,
+  Link2,
+  LoaderCircle,
+  MessageCircle,
+  Minimize2,
+  Pencil,
+  RefreshCw,
+  Sparkles,
+  WandSparkles,
+  X
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+
+import {
+  MissionControlDialogShell,
+  MissionControlDialogChip,
+  missionControlDialogButtonClassName,
+  missionControlDialogControlClassName
+} from "@/components/mission-control/mission-control-dialog-shell";
+import { PikoLoader } from "@/components/ui/piko-loader";
+import {
+  clearWorkspaceCreationMinimizedRun,
+  persistWorkspaceCreationMinimizedRun,
+  readWorkspaceCreationMinimizedRunId
+} from "@/components/mission-control/workspace-creation-activity";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { WORKSPACE_CREATION_PROFILES, normalizeWorkspaceCreationProfile, type WorkspaceCreationDepth } from "@/lib/agentos/domains/workspace-creation-policy";
+import { presentWorkspaceCreationDisplay } from "@/lib/agentos/ui/workspace-creation-display";
+import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
+import {
+  createWorkspaceKnowledgeSource,
+  WORKSPACE_KNOWLEDGE_FILE_ACCEPT,
+  type WorkspaceKnowledgeSource
+} from "@/lib/agentos/domains/workspace-knowledge";
+import type { WorkspaceMaterialization } from "@/lib/agentos/domains/workspace-materialization";
+import type {
+  WorkspaceArchitectResult,
+  WorkspaceBlueprintFreshnessResult
+} from "@/lib/agentos/domains/workspace-blueprint";
+import type { WorkspaceCreationRun } from "@/lib/agentos/domains/workspace-creation-run";
+import type { WorkspaceCreationReviewReadiness } from "@/lib/agentos/domains/workspace-creation-review";
+import type { WorkspaceCreateResult } from "@/lib/agentos/contracts";
+import type { ExecutionTopologyProjection } from "@/lib/openclaw/domains/execution-topology";
+import {
+  formatWorkspaceChannelSetup,
+  formatWorkspaceSchedule,
+  formatWorkspaceSourceKind,
+  humanProjectFactLabel,
+  presentWorkspaceBlueprint,
+  presentWorkspaceReviewRecovery,
+  type WorkspaceBlueprintReviewModel
+} from "@/lib/agentos/ui/workspace-create-presenter";
+import { presentWorkspaceCreationExperience } from "@/lib/agentos/ui/workspace-creation-experience-presenter";
+
+type SurfaceTheme = "dark" | "light";
+type CreateStage = "intake" | "generating" | "review" | "provisioning";
+type ContextAction = "website" | "github" | null;
+type SourceDraft = { kind: "website" | "repository"; value: string };
+type UrlSourceBuildResult = { source: WorkspaceKnowledgeSource } | { error: string };
+type ContextSourceStatus = "attached" | "reading" | "ready" | "partial" | "error" | "unsupported";
+type ContextSourceState = {
+  status: ContextSourceStatus;
+  warning?: string;
+  storedDocuments?: number;
+  discoveredItems?: number;
+  fetchedItems?: number;
+  currentActivity?: string | null;
+  currentLocator?: string | null;
+};
+type UploadGroup = { sourceId: string; files: File[] };
+type EnvironmentPreparationIntent = { requested: boolean; profileId: string };
+type NativeEnvironmentInventoryState = "idle" | "loading" | "available" | "empty" | "unavailable" | "unsupported" | "denied" | "degraded";
+
+function buildUrlSource(draft: SourceDraft): UrlSourceBuildResult {
+  const value = draft.value.trim();
+  if (!value) return { error: "Add a URL first." };
+
+  const normalized = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : "https://" + value;
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    return { error: "Use a valid http or https URL." };
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { error: "Use a valid http or https URL." };
+  }
+
+  if (draft.kind === "repository" && !["github.com", "www.github.com"].includes(url.hostname.toLowerCase())) {
+    return { error: "Add a GitHub repository URL." };
+  }
+
+  if (draft.kind === "repository" && url.pathname.split("/").filter(Boolean).length < 2) {
+    return { error: "Add a GitHub repository URL." };
+  }
+
+  const label = draft.kind === "repository"
+    ? url.pathname.replace(/^\/+|\/+$/g, "") || "GitHub repository"
+    : url.hostname;
+  const source = createWorkspaceKnowledgeSource({
+    id: draft.kind + "-" + slugify(label) + "-" + Date.now(),
+    kind: draft.kind,
+    label,
+    summary: draft.kind === "repository" ? "User-selected GitHub repository source." : "User-selected website source.",
+    locator: draft.kind === "repository" ? { kind: "repository", remoteUrl: url.toString() } : { kind: "website", url: url.toString() },
+    provenance: "operator"
+  });
+  return { source };
+}
+
+type ProvisioningRun = {
+  runId: string;
+  state: "pending" | "validating" | "materializing" | "bootstrapping" | "preparing-environment" | "applying-composition" | "promoting-knowledge" | "provisioning-agents" | "binding-knowledge" | "applying-capabilities" | "recording-declarations" | "verifying" | "ready" | "partial" | "failed" | "cancelled";
+  result: WorkspaceCreateResult | null;
+  warnings: string[];
+  error: { code: string; message: string } | null;
+  progress: { label: string; detail: string } | null;
+  steps: Array<{ id: string; label: string; status: "pending" | "active" | "complete" | "failed" }>;
+  signals: string[];
+  knowledge: { promotedGenerationId: string | null; sourceIds: string[]; documentCount: number } | null;
+  pendingSetup: { channels: string[]; connections: string[]; automations: string[] };
+  environmentPreparation: {
+    requested: boolean;
+    profileId: string | null;
+    projectPath: string | null;
+    status: "not-requested" | "pending" | "in-progress" | "prepared" | "reused" | "unsupported" | "blocked" | "partial" | "failed" | "unknown";
+    location: "local" | "remote" | "unknown";
+    environmentId: string | null;
+    preparationKey: string | null;
+    reused: boolean | null;
+    cost: { status: "not-requested" | "not-applicable" | "unknown" | "approval-required"; detail: string };
+    retryable: boolean;
+    recovery: string | null;
+    error: { code: string; message: string } | null;
+    updatedAt: string | null;
+  };
+};
+
+type CreateWorkspaceExperienceProps = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  surfaceTheme: SurfaceTheme;
+  onWorkspaceCreated?: (result: WorkspaceCreateResult) => void;
+  onRefresh?: () => Promise<void>;
+  onOpenModelSetup?: () => void;
+  reviewRunId?: string | null;
+  reopenRequest?: { runId: string; nonce: number } | null;
+};
+
+export function CreateWorkspaceExperience({
+  open,
+  onOpenChange,
+  surfaceTheme,
+  onWorkspaceCreated,
+  onRefresh,
+  onOpenModelSetup,
+  reviewRunId = null,
+  reopenRequest = null
+}: CreateWorkspaceExperienceProps) {
+  const isLight = surfaceTheme === "light";
+  const [brief, setBrief] = useState("");
+  const [profile, setProfile] = useState<WorkspaceCreationDepth>("fast");
+  const [continueLearningAfterCreation, setContinueLearningAfterCreation] = useState(true);
+  const [mode, setMode] = useState<"automatic" | "customize">("automatic");
+  const [environmentPreparation, setEnvironmentPreparation] = useState<EnvironmentPreparationIntent>({ requested: false, profileId: "" });
+  const [nativeEnvironmentTopology, setNativeEnvironmentTopology] = useState<ExecutionTopologyProjection | null>(null);
+  const [nativeEnvironmentInventoryState, setNativeEnvironmentInventoryState] = useState<NativeEnvironmentInventoryState>("idle");
+  const [nativeEnvironmentInventoryError, setNativeEnvironmentInventoryError] = useState<string | null>(null);
+  const [nativeEnvironmentInventoryRefresh, setNativeEnvironmentInventoryRefresh] = useState(0);
+  const [constraints, setConstraints] = useState("");
+  const [sources, setSources] = useState<WorkspaceKnowledgeSource[]>([]);
+  const [sourceStates, setSourceStates] = useState<Record<string, ContextSourceState>>({});
+  const [uploadGroups, setUploadGroups] = useState<UploadGroup[]>([]);
+  const [draftContextId, setDraftContextId] = useState<string | null>(null);
+  const [materialization, setMaterialization] = useState<WorkspaceMaterialization>({ mode: "empty" });
+  const [stage, setStage] = useState<CreateStage>("intake");
+  const [result, setResult] = useState<WorkspaceArchitectResult | null>(null);
+  const [creationRun, setCreationRun] = useState<WorkspaceCreationRun | null>(null);
+  const [reviewReadiness, setReviewReadiness] = useState<WorkspaceCreationReviewReadiness | null>(null);
+  const [freshness, setFreshness] = useState<WorkspaceBlueprintFreshnessResult | null>(null);
+  const [contextAction, setContextAction] = useState<ContextAction>(null);
+  const [sourceDraft, setSourceDraft] = useState<SourceDraft>({ kind: "website", value: "" });
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ tone: "warning" | "error" | "muted"; title: string; description: string } | null>(null);
+  const [revisionValue, setRevisionValue] = useState("");
+  const [revisionError, setRevisionError] = useState<string | null>(null);
+  const [isRevising, setIsRevising] = useState(false);
+  const [isRefreshingProject, setIsRefreshingProject] = useState(false);
+  const [isCustomizing, setIsCustomizing] = useState(false);
+  const [customName, setCustomName] = useState("");
+  const [customPrimaryName, setCustomPrimaryName] = useState("");
+  const [isSavingCustomization, setIsSavingCustomization] = useState(false);
+  const [provisioningRun, setProvisioningRun] = useState<ProvisioningRun | null>(null);
+  const [provisioningError, setProvisioningError] = useState<string | null>(null);
+  const [isProvisioningStarting, setIsProvisioningStarting] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(false);
+  const [basicDraftApproved, setBasicDraftApproved] = useState(false);
+  const [isRebuildingPlan, setIsRebuildingPlan] = useState(false);
+  const [showStartOverConfirmation, setShowStartOverConfirmation] = useState(false);
+  const [isStartingOver, setIsStartingOver] = useState(false);
+  const [startOverError, setStartOverError] = useState<string | null>(null);
+  const provisioningKeyRef = useRef<string | null>(null);
+  const automaticProvisionRef = useRef<string | null>(null);
+  const provisioningPollRef = useRef<AbortController | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const hasLocalDraftRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!environmentPreparation.requested) {
+      setNativeEnvironmentInventoryState("idle");
+      setNativeEnvironmentInventoryError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setNativeEnvironmentInventoryState("loading");
+    setNativeEnvironmentInventoryError(null);
+    void (async () => {
+      try {
+        const response = await fetch("/api/openclaw/execution-topology", { cache: "no-store", signal: controller.signal });
+        const payload = await response.json().catch(() => null) as { topology?: ExecutionTopologyProjection; error?: string; code?: string } | null;
+        if (!response.ok || !payload?.topology) {
+          if (controller.signal.aborted) return;
+          const state: NativeEnvironmentInventoryState = response.status === 401 || response.status === 403
+            ? "denied"
+            : payload?.code === "openclaw-topology-unavailable"
+              ? "unsupported"
+              : "unavailable";
+          setNativeEnvironmentInventoryState(state);
+          setNativeEnvironmentInventoryError(payload?.error || "OpenClaw native profile inventory could not be loaded.");
+          return;
+        }
+        if (controller.signal.aborted) return;
+        setNativeEnvironmentTopology(payload.topology);
+        setNativeEnvironmentInventoryState(
+          payload.topology.sourceStatus === "unknown"
+            ? "degraded"
+            : payload.topology.sourceStatus === "unavailable"
+              ? "unsupported"
+              : payload.topology.profiles.length ? "available" : "empty"
+        );
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setNativeEnvironmentInventoryState("unavailable");
+        setNativeEnvironmentInventoryError(error instanceof Error ? error.message : "OpenClaw native profile inventory could not be loaded.");
+      }
+    })();
+    return () => controller.abort();
+  }, [environmentPreparation.requested, nativeEnvironmentInventoryRefresh]);
+
+  useEffect(() => {
+    if (!environmentPreparation.requested || nativeEnvironmentInventoryState !== "available" || !nativeEnvironmentTopology) return;
+    if (environmentPreparation.profileId && !nativeEnvironmentTopology.profiles.some((profile) => profile.id === environmentPreparation.profileId)) {
+      setEnvironmentPreparation({ requested: true, profileId: "" });
+    }
+  }, [environmentPreparation, nativeEnvironmentInventoryState, nativeEnvironmentTopology]);
+
+  const reviewProfile = creationRun?.expediteRequestedAt
+    ? "fast"
+    : creationRun?.input.profile ? normalizeWorkspaceCreationProfile(creationRun.input.profile) : profile;
+  const review = useMemo(
+    () => (result ? presentWorkspaceBlueprint(result, {
+      profile: reviewProfile,
+      partialContext: creationRun?.snapshot.context.status === "partial",
+      attempts: creationRun?.snapshot.architect.attempts,
+      elapsedMs: creationRun?.snapshot.architect.elapsedMs,
+      retryAvailable: creationRun?.snapshot.architect.retryAvailable,
+      failureCategory: creationRun?.snapshot.architect.failure?.code ?? null,
+      extraction: creationRun?.snapshot.extraction ?? null,
+      intelligence: creationRun?.snapshot.intelligence ?? null,
+      composition: creationRun?.snapshot.composition ?? null,
+      readiness: reviewReadiness ?? creationRun?.snapshot.reviewReadiness ?? null
+    }) : null),
+    [creationRun, result, reviewProfile, reviewReadiness]
+  );
+  const experience = useMemo(() => presentWorkspaceCreationExperience({ run: creationRun, result, provisioningRun, sources }), [creationRun, provisioningRun, result, sources]);
+  const nativeEnvironmentPreparationReady = !environmentPreparation.requested
+    || (nativeEnvironmentInventoryState === "available"
+      && Boolean(environmentPreparation.profileId && getNativeEnvironmentProfiles(nativeEnvironmentTopology).some((profile) => profile.id === environmentPreparation.profileId)));
+  const nativeEnvironmentPreparationMessage = getNativeEnvironmentPreparationMessage(
+    environmentPreparation,
+    nativeEnvironmentInventoryState,
+    nativeEnvironmentTopology,
+    nativeEnvironmentInventoryError
+  );
+  const isActiveRun = stage === "generating" || stage === "provisioning" || isProvisioningStarting;
+
+  const resetCreationState = () => {
+    abortControllerRef.current?.abort();
+    provisioningPollRef.current?.abort();
+    setBrief("");
+    setProfile("fast");
+    setContinueLearningAfterCreation(true);
+    setMode("automatic");
+    setEnvironmentPreparation({ requested: false, profileId: "" });
+    setNativeEnvironmentTopology(null);
+    setNativeEnvironmentInventoryState("idle");
+    setNativeEnvironmentInventoryError(null);
+    setNativeEnvironmentInventoryRefresh(0);
+    setConstraints("");
+    setSources([]);
+    setSourceStates({});
+    setUploadGroups([]);
+    setDraftContextId(null);
+    setMaterialization({ mode: "empty" });
+    setStage("intake");
+    setResult(null);
+    setCreationRun(null);
+    setReviewReadiness(null);
+    setFreshness(null);
+    setContextAction(null);
+    setSourceDraft({ kind: "website", value: "" });
+    setSourceError(null);
+    setNotice(null);
+    setRevisionValue("");
+    setRevisionError(null);
+    setIsRefreshingProject(false);
+    setIsCustomizing(false);
+    setProvisioningRun(null);
+    setProvisioningError(null);
+    setIsProvisioningStarting(false);
+    setBasicDraftApproved(false);
+    setIsRebuildingPlan(false);
+    setShowStartOverConfirmation(false);
+    setIsStartingOver(false);
+    setStartOverError(null);
+    setIsMinimized(false);
+    clearWorkspaceCreationMinimizedRun();
+    provisioningKeyRef.current = null;
+    automaticProvisionRef.current = null;
+    hasLocalDraftRef.current = false;
+  };
+
+  const certifyReview = useCallback(async (runId: string, acceptDraft: boolean) => {
+    const response = await fetch(`/api/workspaces/creation-runs/${runId}/readiness?acceptDraft=${acceptDraft ? "true" : "false"}`);
+    const payload = (await response.json().catch(() => null)) as { run?: WorkspaceCreationRun; readiness?: WorkspaceCreationReviewReadiness; error?: string } | null;
+    if (!response.ok || !payload?.run || !payload.readiness) throw new Error(payload?.error || "AgentOS could not certify the workspace review.");
+    setCreationRun(payload.run);
+    setReviewReadiness(payload.readiness);
+    return { run: payload.run, readiness: payload.readiness };
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      abortControllerRef.current?.abort();
+      setIsMinimized(false);
+      provisioningPollRef.current?.abort();
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !isActiveRun) setIsMinimized(false);
+  }, [isActiveRun, open]);
+
+  useEffect(() => {
+    if (isMinimized && isActiveRun && creationRun?.runId) {
+      persistWorkspaceCreationMinimizedRun(creationRun.runId);
+    }
+
+    if (!isActiveRun && creationRun?.runId) {
+      clearWorkspaceCreationMinimizedRun();
+    }
+  }, [creationRun?.runId, isActiveRun, isMinimized]);
+
+  const minimizeWorkspaceCreation = useCallback(() => {
+    setIsMinimized(true);
+    if (creationRun?.runId) {
+      persistWorkspaceCreationMinimizedRun(creationRun.runId);
+    }
+  }, [creationRun?.runId]);
+
+  useEffect(() => {
+    if (reopenRequest) {
+      setIsMinimized(false);
+    }
+  }, [reopenRequest]);
+
+  const handleDialogOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen && isActiveRun) {
+      minimizeWorkspaceCreation();
+      return;
+    }
+    setIsMinimized(false);
+    clearWorkspaceCreationMinimizedRun();
+    if (!nextOpen && (provisioningRun?.state === "ready" || provisioningRun?.state === "partial")) {
+      resetCreationState();
+    }
+    onOpenChange(nextOpen);
+  };
+
+  const markContextChanged = () => {
+    if (result) {
+      const currentFreshness = freshness ?? result.freshness;
+      setFreshness({
+        blueprintGenerationId: currentFreshness.blueprintGenerationId,
+        currentGenerationId: currentFreshness.currentGenerationId,
+        status: "stale",
+        reason: "Project context changed after this blueprint was produced."
+      });
+    }
+  };
+
+  const generate = async () => {
+    const nextBrief = brief.trim();
+    if (!nextBrief || stage === "generating") return;
+
+    const pendingSourceResult = sourceDraft.value.trim() ? buildUrlSource(sourceDraft) : null;
+    if (pendingSourceResult && "error" in pendingSourceResult) {
+      setSourceError(pendingSourceResult.error);
+      setNotice({
+        tone: "error",
+        title: "Check the project URL",
+        description: pendingSourceResult.error
+      });
+      return;
+    }
+    const pendingSource = pendingSourceResult && "source" in pendingSourceResult ? pendingSourceResult.source : null;
+    const nextSources = pendingSource ? [...sources, pendingSource] : sources;
+    const pendingRepositoryUrl = pendingSource?.locator.kind === "repository" ? pendingSource.locator.remoteUrl : undefined;
+    const nextMaterialization: WorkspaceMaterialization = pendingRepositoryUrl
+      ? { mode: "clone", repoUrl: pendingRepositoryUrl }
+      : materialization;
+    if (pendingSource) {
+      setSources(nextSources);
+      setSourceStates((current) => ({ ...current, [pendingSource.id]: { status: "attached" } }));
+      if (pendingRepositoryUrl) setMaterialization(nextMaterialization);
+      setContextAction(null);
+      setSourceDraft({ kind: "website", value: "" });
+      setSourceError(null);
+    }
+
+    clearWorkspaceCreationMinimizedRun();
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setStage("generating");
+    setIsProvisioningStarting(false);
+    setNotice(null);
+    setRevisionError(null);
+
+    try {
+      const formData = new FormData();
+      formData.set("idempotencyKey", crypto.randomUUID());
+      formData.set("brief", nextBrief);
+      formData.set("mode", mode === "automatic" ? "automatic" : "review");
+      formData.set("profile", profile);
+      formData.set("continueLearningAfterCreation", String(continueLearningAfterCreation));
+      formData.set("operatorConstraints", JSON.stringify(constraints.split("\n").map((line) => line.trim()).filter(Boolean)));
+      formData.set("materialization", JSON.stringify(nextMaterialization));
+      formData.set("sources", JSON.stringify(nextSources));
+      if (draftContextId) formData.set("draftContextId", draftContextId);
+      const manifest: Array<{ sourceId: string; relativePath: string; fileName: string }> = [];
+      for (const group of uploadGroups) {
+        for (const file of group.files) {
+          manifest.push({ sourceId: group.sourceId, relativePath: file.webkitRelativePath || file.name, fileName: file.name });
+          formData.append("files", file, file.name);
+        }
+      }
+      formData.set("uploadManifest", JSON.stringify(manifest));
+      const response = await fetch("/api/workspaces/creation-runs", { method: "POST", body: formData, signal: controller.signal });
+      const initial = (await response.json().catch(() => null)) as WorkspaceCreationRun & { error?: string } | null;
+      if (!response.ok || !initial?.runId) throw new Error(initial?.error || "AgentOS could not start workspace creation.");
+      hasLocalDraftRef.current = true;
+      setCreationRun(initial);
+      setDraftContextId(initial.draftContextId);
+      const completedRun = await pollCreationRun(initial.runId, controller, initial, nextSources);
+      setProvisioningRun(null);
+      setProvisioningError(null);
+      provisioningKeyRef.current = null;
+      setStage(
+        mode === "automatic"
+          && !environmentPreparation.requested
+          && completedRun.snapshot.reviewReadiness?.provisionable === true
+          ? "generating"
+          : "review"
+      );
+      setRevisionValue("");
+      setIsCustomizing(false);
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+        setStage("intake");
+        setNotice({
+          tone: "warning",
+          title: "Generation cancelled",
+          description: "Your brief and context are still here when you are ready to try again."
+        });
+        return;
+      }
+
+      setStage("intake");
+      setNotice({
+        tone: "error",
+        title: "Architect temporarily unavailable",
+        description: error instanceof Error ? error.message : "Try again without losing your project context."
+      });
+    } finally {
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
+    }
+  };
+
+  const pollCreationRun = useCallback(async (runId: string, controller: AbortController, initial: WorkspaceCreationRun, sourceList: WorkspaceKnowledgeSource[]) => {
+    let afterSequence = initial.events.at(-1)?.sequence ?? 0;
+    for (;;) {
+      if (controller.signal.aborted) throw new DOMException("Workspace creation was cancelled.", "AbortError");
+      const response = await fetch(`/api/workspaces/creation-runs/${runId}?afterSequence=${afterSequence}`, { signal: controller.signal });
+      const payload = (await response.json().catch(() => null)) as WorkspaceCreationRun & { error?: string } | null;
+      if (!response.ok || !payload?.runId) throw new Error(payload?.error || "AgentOS could not read workspace creation progress.");
+      setCreationRun(payload);
+      if (payload.snapshot.reviewReadiness) setReviewReadiness(payload.snapshot.reviewReadiness);
+      afterSequence = payload.events.at(-1)?.sequence ?? afterSequence;
+      if (payload.snapshot.context.sourceProgress?.length) {
+        setSourceStates((existing) => Object.fromEntries(payload.snapshot.context.sourceProgress.map((progress) => [progress.sourceId, {
+          ...existing[progress.sourceId],
+          status: mapCreationSourceStatus(progress.state),
+          discoveredItems: progress.discoveredItems,
+          fetchedItems: progress.fetchedItems,
+          storedDocuments: progress.storedDocuments,
+          currentActivity: progress.currentActivity,
+          currentLocator: progress.currentLocator
+        }])))
+      }
+      if (payload.snapshot.context.status === "partial") {
+        setSourceStates((existing) => Object.fromEntries(sourceList.map((source) => [source.id, { ...existing[source.id], ...(existing[source.id] ? {} : { status: "partial" as const }), warning: "Architecture generated from partial project context." }])));
+      }
+      if (payload.snapshot.state === "review-ready") {
+        const generated = payload.result as WorkspaceArchitectResult | null;
+        if (!generated?.blueprint) throw new Error("Workspace creation completed without a reviewable blueprint.");
+        setResult(generated);
+        setFreshness(generated.freshness);
+        setRevisionValue("");
+        setIsCustomizing(false);
+        setCustomName(generated.blueprint.identity.name);
+        setCustomPrimaryName(generated.blueprint.workforce.primaryAgent.name);
+        return payload;
+      }
+      if (payload.snapshot.state === "cancelled") throw new DOMException("Workspace creation was cancelled.", "AbortError");
+      if (payload.snapshot.state === "failed") throw new Error(payload.snapshot.architect.failure?.message || "Workspace creation failed.");
+      await wait(450, controller.signal);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open || hasLocalDraftRef.current && !reviewRunId && !reopenRequest) return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const minimizedRunId = reopenRequest?.runId.trim() || reviewRunId?.trim() || readWorkspaceCreationMinimizedRunId();
+        const response = await fetch(
+          minimizedRunId
+            ? `/api/workspaces/creation-runs/${encodeURIComponent(minimizedRunId)}`
+            : "/api/workspaces/creation-runs?resumable=true",
+          { signal: controller.signal }
+        );
+        const payload = await response.json().catch(() => null) as WorkspaceCreationRun & { runs?: WorkspaceCreationRun[] } | null;
+        const activeRun = minimizedRunId ? payload : payload?.runs?.[0];
+        if (!response.ok || !activeRun || controller.signal.aborted) return;
+        clearWorkspaceCreationMinimizedRun();
+        const recoveredSources = activeRun.input.sources as WorkspaceKnowledgeSource[];
+        setBrief(activeRun.input.brief);
+        setProfile(normalizeWorkspaceCreationProfile(activeRun.input.profile));
+        setContinueLearningAfterCreation(activeRun.input.continueLearningAfterCreation !== false);
+        setMode(activeRun.input.mode === "automatic" ? "automatic" : "customize");
+        setSources(recoveredSources);
+        setConstraints(activeRun.input.operatorConstraints.join("\n"));
+        setDraftContextId(activeRun.draftContextId);
+        setMaterialization(activeRun.input.materialization as WorkspaceMaterialization);
+        setCreationRun(activeRun);
+        hasLocalDraftRef.current = true;
+        if (activeRun.snapshot.reviewReadiness) setReviewReadiness(activeRun.snapshot.reviewReadiness);
+
+        const recoverProvisioningRun = async (run: WorkspaceCreationRun) => {
+          if (!run.snapshot.provisioningRunId) return null;
+          const provisioningResponse = await fetch(`/api/workspaces/provision?runId=${encodeURIComponent(run.snapshot.provisioningRunId)}`, { signal: controller.signal });
+          const recoveredProvisioning = (await provisioningResponse.json().catch(() => null)) as ProvisioningRun & { error?: string } | null;
+          if (!provisioningResponse.ok || !recoveredProvisioning?.runId) return null;
+          setProvisioningRun(recoveredProvisioning);
+          setEnvironmentPreparation(recoveredProvisioning.environmentPreparation.requested
+            ? { requested: true, profileId: recoveredProvisioning.environmentPreparation.profileId ?? "" }
+            : { requested: false, profileId: "" });
+          return recoveredProvisioning;
+        };
+
+        const recoveredProvisioning = await recoverProvisioningRun(activeRun);
+        if (activeRun.snapshot.state === "review-ready") {
+          const recoveredResult = activeRun.result as WorkspaceArchitectResult | null;
+          if (!recoveredResult?.blueprint) return;
+          setResult(recoveredResult);
+          setFreshness(recoveredResult.freshness);
+          setCustomName(recoveredResult.blueprint.identity.name);
+          setCustomPrimaryName(recoveredResult.blueprint.workforce.primaryAgent.name);
+          setStage("review");
+          return;
+        }
+        setStage("generating");
+        abortControllerRef.current = controller;
+        const recoveredRun = await pollCreationRun(activeRun.runId, controller, activeRun, recoveredSources);
+        const completedProvisioning = recoveredProvisioning ?? await recoverProvisioningRun(recoveredRun);
+        if (completedProvisioning) setStage(isProvisioningTerminal(completedProvisioning.state) ? "review" : "provisioning");
+        else setStage("review");
+      } catch {
+        // Reload recovery is best-effort; the durable run remains available to a later poll.
+      }
+    })();
+    return () => controller.abort();
+  }, [open, pollCreationRun, reopenRequest, reviewRunId]);
+
+  const refreshProject = async () => {
+    if (!creationRun || isRefreshingProject) return;
+    const controller = new AbortController();
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = controller;
+    setIsRefreshingProject(true);
+    setRevisionError(null);
+    setStage("generating");
+    try {
+      const response = await fetch(`/api/workspaces/creation-runs/${creationRun.runId}/refresh`, { method: "POST", signal: controller.signal });
+      const next = (await response.json().catch(() => null)) as WorkspaceCreationRun & { error?: string } | null;
+      if (!response.ok || !next?.runId) throw new Error(next?.error || "AgentOS could not refresh the project context.");
+      setCreationRun(next);
+      setDraftContextId(next.draftContextId);
+      setResult(null);
+      setFreshness(null);
+      await pollCreationRun(next.runId, controller, next, sources);
+      setStage("review");
+    } catch (error) {
+      if (!controller.signal.aborted) setRevisionError(error instanceof Error ? error.message : "The project context could not be refreshed.");
+      if (!controller.signal.aborted) setStage("review");
+    } finally {
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
+      setIsRefreshingProject(false);
+    }
+  };
+
+  const cancelGeneration = () => {
+    const runId = creationRun?.runId;
+    if (runId) {
+      void fetch(`/api/workspaces/creation-runs/${runId}/cancel`, { method: "POST", keepalive: true }).catch(() => undefined);
+    }
+    abortControllerRef.current?.abort();
+  };
+
+  const continueNow = async () => {
+    if (!creationRun || creationRun.expediteRequestedAt) return;
+    try {
+      const response = await fetch(`/api/workspaces/creation-runs/${creationRun.runId}/continue-now`, { method: "POST" });
+      const payload = (await response.json().catch(() => null)) as WorkspaceCreationRun & { error?: string } | null;
+      if (!response.ok || !payload?.runId) throw new Error(payload?.error || "Minimum project context is not ready yet.");
+      setCreationRun(payload);
+      setNotice({ tone: "muted", title: "Finishing with what we have…", description: "Your current project context is preserved." });
+    } catch (error) {
+      setNotice({ tone: "warning", title: "Still gathering context", description: error instanceof Error ? error.message : "AgentOS is finishing the current context pass." });
+    }
+  };
+
+  const revise = async () => {
+    if (!result || !revisionValue.trim() || isRevising) return;
+
+    setIsRevising(true);
+    setRevisionError(null);
+    try {
+      if (!creationRun) throw new Error("The saved workspace creation run is unavailable.");
+      const response = await fetch(`/api/workspaces/creation-runs/${creationRun.runId}/revise`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instruction: revisionValue.trim(),
+          operatorConstraints: constraints
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean)
+        })
+      });
+      const payload = (await response.json().catch(() => null)) as WorkspaceCreationRun & { error?: string } | null;
+      const revised = payload?.result as WorkspaceArchitectResult | null;
+      if (!response.ok || !payload?.runId || !revised?.blueprint) {
+        throw new Error(payload?.error || "AgentOS could not revise the workspace draft.");
+      }
+
+      setCreationRun(payload);
+      setResult(revised);
+      setFreshness(revised.freshness);
+      setReviewReadiness(null);
+      setBasicDraftApproved(false);
+      setProvisioningRun(null);
+      setProvisioningError(null);
+      provisioningKeyRef.current = null;
+      setRevisionValue("");
+      setCustomName(revised.blueprint.identity.name);
+      setCustomPrimaryName(revised.blueprint.workforce.primaryAgent.name);
+      await certifyReview(payload.runId, false);
+    } catch (error) {
+      setRevisionError(error instanceof Error ? error.message : "The revision could not be applied.");
+    } finally {
+      setIsRevising(false);
+    }
+  };
+
+  const saveCustomization = async () => {
+    if (!result || isSavingCustomization) return;
+    const nextName = customName.trim();
+    const nextPrimaryName = customPrimaryName.trim();
+    if (!nextName || !nextPrimaryName) return;
+
+    setIsSavingCustomization(true);
+    setRevisionError(null);
+    try {
+      if (!creationRun) throw new Error("The saved workspace creation run is unavailable.");
+      const response = await fetch(`/api/workspaces/creation-runs/${creationRun.runId}/revise`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operatorEdits: {
+            identity: { name: nextName },
+            workforce: { primaryAgent: { name: nextPrimaryName } }
+          },
+        })
+      });
+      const payload = (await response.json().catch(() => null)) as WorkspaceCreationRun & { error?: string } | null;
+      const revised = payload?.result as WorkspaceArchitectResult | null;
+      if (!response.ok || !payload?.runId || !revised?.blueprint) {
+        throw new Error(payload?.error || "The workspace edits could not be saved.");
+      }
+
+      setCreationRun(payload);
+      setResult(revised);
+      setFreshness(revised.freshness);
+      setReviewReadiness(null);
+      setBasicDraftApproved(false);
+      setProvisioningRun(null);
+      setProvisioningError(null);
+      provisioningKeyRef.current = null;
+      setIsCustomizing(false);
+      await certifyReview(payload.runId, false);
+    } catch (error) {
+      setRevisionError(error instanceof Error ? error.message : "The workspace edits could not be saved.");
+    } finally {
+      setIsSavingCustomization(false);
+    }
+  };
+
+  const approveBasicDraft = async () => {
+    if (!creationRun) return;
+    try {
+      const certified = await certifyReview(creationRun.runId, true);
+      setBasicDraftApproved(certified.readiness.provisionable);
+    } catch (error) {
+      setRevisionError(error instanceof Error ? error.message : "The basic draft could not be accepted.");
+    }
+  };
+
+  const rebuildPlan = async () => {
+    if (!creationRun || isRebuildingPlan) return;
+    setIsRebuildingPlan(true);
+    setRevisionError(null);
+    try {
+      const response = await fetch(`/api/workspaces/creation-runs/${creationRun.runId}/rebuild-plan?acceptDraft=${basicDraftApproved ? "true" : "false"}`, { method: "POST" });
+      const payload = (await response.json().catch(() => null)) as { run?: WorkspaceCreationRun; readiness?: WorkspaceCreationReviewReadiness; error?: string } | null;
+      if (!response.ok || !payload?.run || !payload.readiness) throw new Error(payload?.error || "AgentOS could not rebuild the workspace plan.");
+      setCreationRun(payload.run);
+      setReviewReadiness(payload.readiness);
+    } catch (error) {
+      setRevisionError(error instanceof Error ? error.message : "The workspace plan could not be rebuilt.");
+    } finally {
+      setIsRebuildingPlan(false);
+    }
+  };
+
+  const startOver = async () => {
+    if (isStartingOver) return;
+    setIsStartingOver(true);
+    setStartOverError(null);
+    if (!creationRun) {
+      resetCreationState();
+      return;
+    }
+    try {
+      const response = await fetch(`/api/workspaces/creation-runs/${creationRun.runId}/abandon`, { method: "POST" });
+      const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+      if (!response.ok) throw new Error(payload?.error || "The current workspace draft could not be abandoned.");
+      resetCreationState();
+    } catch (error) {
+      setStartOverError(error instanceof Error ? error.message : "The current workspace draft could not be abandoned.");
+    } finally {
+      setIsStartingOver(false);
+    }
+  };
+
+  const provision = useCallback(async (options: { retryEnvironmentPreparation?: boolean } = {}) => {
+    if (!result || stage === "provisioning" || isProvisioningStarting) return;
+    if (!creationRun) return;
+    if (!nativeEnvironmentPreparationReady) {
+      setRevisionError(nativeEnvironmentPreparationMessage);
+      return;
+    }
+
+    const controller = new AbortController();
+    provisioningPollRef.current?.abort();
+    provisioningPollRef.current = controller;
+    setIsProvisioningStarting(true);
+    setStage("generating");
+    setProvisioningRun(null);
+    setProvisioningError(null);
+    try {
+      const certified = await certifyReview(creationRun.runId, basicDraftApproved);
+      if (!certified.readiness.provisionable) {
+        setRevisionError(certified.readiness.message);
+        setStage("review");
+        return;
+      }
+      const serverRun = certified.run;
+      const serverResult = serverRun.result as WorkspaceArchitectResult | null;
+      if (!serverResult?.blueprint) {
+        setRevisionError("The reviewed workspace draft is no longer available.");
+        setStage("review");
+        return;
+      }
+      const response = await fetch("/api/workspaces/provision", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          blueprint: serverResult.blueprint,
+          draftContextId: serverRun.draftContextId,
+          expectedKnowledgeGenerationId: serverResult.freshness.currentGenerationId,
+          idempotencyKey: "server-certified",
+          acceptDraft: basicDraftApproved || normalizeWorkspaceCreationProfile(serverRun.input.profile) !== "high",
+          creationRunId: serverRun.runId,
+          compositionPlanId: serverRun.snapshot.composition?.planId ?? null,
+          compositionPlanFingerprint: serverRun.snapshot.composition?.inputFingerprint ?? null,
+          environmentPreparation: environmentPreparation.requested
+            ? { requested: true, profileId: environmentPreparation.profileId }
+            : null,
+          retryEnvironmentPreparation: options.retryEnvironmentPreparation === true
+        })
+      });
+      const payload = (await response.json().catch(() => null)) as ProvisioningRun & { error?: string } | null;
+      if (!response.ok || !payload?.runId) throw new Error(payload?.error || "AgentOS could not start workspace provisioning.");
+
+      let current = payload;
+      setProvisioningRun(current);
+      setIsProvisioningStarting(false);
+      setStage("provisioning");
+      while (!isProvisioningTerminal(current.state)) {
+        await wait(450, controller.signal);
+        const statusResponse = await fetch(`/api/workspaces/provision?runId=${encodeURIComponent(current.runId)}`, { signal: controller.signal });
+        const statusPayload = (await statusResponse.json().catch(() => null)) as ProvisioningRun & { error?: string } | null;
+        if (!statusResponse.ok || !statusPayload?.runId) throw new Error(statusPayload?.error || "AgentOS could not read workspace provisioning status.");
+        current = statusPayload;
+        setProvisioningRun(current);
+      }
+
+      if (current.state === "failed" || current.state === "cancelled") {
+        setProvisioningError(current.error?.message || "Workspace provisioning did not complete.");
+      } else {
+        await onRefresh?.().catch(() => undefined);
+      }
+      setStage("review");
+    } catch (error) {
+      if (controller.signal.aborted) {
+        setIsProvisioningStarting(false);
+        setStage("review");
+        return;
+      }
+      setProvisioningError(error instanceof Error ? error.message : "Workspace provisioning did not complete.");
+      setIsProvisioningStarting(false);
+      setStage("review");
+    } finally {
+      setIsProvisioningStarting(false);
+      if (provisioningPollRef.current === controller) provisioningPollRef.current = null;
+    }
+  }, [result, stage, isProvisioningStarting, creationRun, certifyReview, basicDraftApproved, environmentPreparation, nativeEnvironmentPreparationReady, nativeEnvironmentPreparationMessage, onRefresh]);
+
+  const retryProvisioning = useCallback(async () => {
+    setProvisioningError(null);
+    await onRefresh?.().catch(() => undefined);
+    await provision();
+  }, [onRefresh, provision]);
+
+  const openModelSetup = useCallback(() => {
+    if (onOpenModelSetup) {
+      onOpenModelSetup();
+      return;
+    }
+    if (typeof window !== "undefined") window.location.assign("/settings#models");
+  }, [onOpenModelSetup]);
+
+  useEffect(() => {
+    if (!open || (stage !== "review" && stage !== "generating") || !creationRun || !result || !reviewReadiness?.provisionable
+      || creationRun.snapshot.state !== "review-ready"
+      || reviewRunId || provisioningRun || provisioningError || isProvisioningStarting || creationRun.input.mode !== "automatic"
+      || environmentPreparation.requested
+      || creationRun.input.trigger === "post-create-enrichment" || creationRun.input.trigger === "manual-refresh"
+      || automaticProvisionRef.current === creationRun.runId) return;
+    automaticProvisionRef.current = creationRun.runId;
+    void provision();
+  }, [open, stage, creationRun, result, reviewReadiness, reviewRunId, provisioningRun, provisioningError, isProvisioningStarting, environmentPreparation.requested, provision]);
+
+  const openProvisionedWorkspace = () => {
+    if (!provisioningRun?.result) {
+      setProvisioningError("Workspace is ready, but its open target is unavailable. Close this screen and select it from the workspace menu.");
+      return;
+    }
+    onWorkspaceCreated?.(provisioningRun.result);
+    resetCreationState();
+    onOpenChange(false);
+  };
+
+  const addUrlSource = () => {
+    const result = buildUrlSource(sourceDraft);
+    if ("error" in result) {
+      setSourceError(result.error);
+      return;
+    }
+
+    const { source } = result;
+    setSources((current) => [...current, source]);
+    setSourceStates((current) => ({ ...current, [source.id]: { status: "attached" } }));
+    if (source.locator.kind === "repository" && source.locator.remoteUrl) {
+      setMaterialization({ mode: "clone", repoUrl: source.locator.remoteUrl });
+    }
+    setContextAction(null);
+    setSourceDraft({ kind: "website", value: "" });
+    setSourceError(null);
+    markContextChanged();
+  };
+
+  const handleFiles = (fileList: FileList | null, kind: "file" | "folder") => {
+    if (!fileList?.length) return;
+    const files = Array.from(fileList).slice(0, kind === "folder" ? 120 : 12);
+    const folderName = files[0]?.webkitRelativePath?.split("/")[0] || files[0]?.name || "Local project";
+    const source = createWorkspaceKnowledgeSource({
+      id: `${kind}-${slugify(folderName)}-${Date.now()}`,
+      kind,
+      label: kind === "folder" ? folderName : files.length === 1 ? files[0].name : `${files.length} project files`,
+      summary: kind === "folder" ? `${files.length} local project files attached for reading.` : `${files.length} project file${files.length === 1 ? "" : "s"} attached for reading.`,
+      locator: { kind, path: `upload:${kind}-${Date.now()}` },
+      provenance: "operator"
+    });
+    setSources((current) => [...current, source]);
+    setSourceStates((current) => ({ ...current, [source.id]: { status: "attached" } }));
+    setUploadGroups((current) => [...current, { sourceId: source.id, files }]);
+    setContextAction(null);
+    markContextChanged();
+  };
+
+  const removeSource = (sourceId: string) => {
+    setSources((current) => current.filter((source) => source.id !== sourceId));
+    setSourceStates((current) => { const next = { ...current }; delete next[sourceId]; return next; });
+    setUploadGroups((current) => current.filter((group) => group.sourceId !== sourceId));
+    const removed = sources.find((source) => source.id === sourceId);
+    if (removed?.locator.kind === "repository" && materialization.mode === "clone" && removed.locator.remoteUrl === materialization.repoUrl) {
+      setMaterialization({ mode: "empty" });
+    }
+    markContextChanged();
+  };
+
+  const reviewModel = review
+    ? {
+        ...review,
+        freshness: freshness ?? review.freshness
+      }
+    : null;
+
+  const isProvisioned = provisioningRun?.state === "ready" || provisioningRun?.state === "partial";
+  const isProvisioningInFlight = isProvisioningStarting || stage === "provisioning" || Boolean(provisioningRun);
+  const isEnrichmentReview = Boolean(reviewRunId && creationRun?.runId === reviewRunId);
+  const title = isEnrichmentReview && stage === "review" ? "Review workspace updates" : experience.title;
+
+  return (
+    <>
+      <PikoLoader
+        open={open && !isMinimized && isActiveRun}
+        title={isProvisioningInFlight ? "Creating your workspace" : "Learning about your project"}
+        description={isProvisioningStarting ? "Setting up your workspace…" : experience.primaryStatus}
+      />
+      <MissionControlDialogShell
+      open={open && !isMinimized}
+      onOpenChange={handleDialogOpenChange}
+      surfaceTheme={surfaceTheme}
+      title={isProvisioned ? "Workspace ready" : stage === "intake" ? "Create a workspace" : isEnrichmentReview ? title : result?.blueprint.identity.name || "Creating your workspace"}
+      description={isProvisioned ? "Your workspace is ready to open." : <span className="sr-only">Prepare your workspace</span>}
+      icon={isProvisioned ? Check : undefined}
+      chips={isProvisioned ? <MissionControlDialogChip tone={provisioningRun?.state === "partial" ? "amber" : "emerald"} surfaceTheme={surfaceTheme}>{provisioningRun?.state === "partial" ? "Ready with setup pending" : "Ready to open"}</MissionControlDialogChip> : undefined}
+      variant="quiet"
+      closeLabel={isActiveRun ? "Minimize workspace creation" : undefined}
+      onOutsideInteraction={isActiveRun ? minimizeWorkspaceCreation : undefined}
+      headerActions={isActiveRun ? (
+        <Button
+          type="button"
+          variant="ghost"
+          onClick={minimizeWorkspaceCreation}
+          aria-label="Minimize workspace creation"
+          className={cn("h-8 w-8 rounded-lg p-0", isLight ? "text-[#756b61] hover:bg-[#f1ebe3] hover:text-[#2d241f]" : "text-slate-300 hover:bg-white/[0.06] hover:text-white")}
+        >
+          <Minimize2 className="h-4 w-4" aria-hidden="true" />
+        </Button>
+      ) : null}
+      contentClassName={cn("sm:w-[min(92vw,680px)] sm:h-[min(90dvh,740px)] sm:rounded-2xl", isProvisioned && "sm:w-[min(92vw,820px)]")}
+      headerClassName="px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))] md:px-7 md:pb-4 md:pt-5"
+      bodyClassName="p-0 overflow-hidden"
+      footerClassName="px-4 pb-[calc(0.75rem+env(safe-area-inset-bottom))] pt-3 md:px-7 md:py-4"
+      footerInnerClassName="p-0"
+      footer={
+        stage === "generating" && !isProvisioningStarting ? (
+          <div className="flex w-full items-center justify-end gap-3">
+            <Button type="button" variant="secondary" onClick={cancelGeneration} className={missionControlDialogButtonClassName("secondary", surfaceTheme)}>
+              Cancel
+            </Button>
+          </div>
+        ) : stage === "generating" || stage === "provisioning" ? (
+          <div className="flex w-full items-center justify-end gap-3">
+            <Button type="button" variant="secondary" onClick={minimizeWorkspaceCreation} className={missionControlDialogButtonClassName("secondary", surfaceTheme)}>Minimize</Button>
+          </div>
+        ) : stage === "review" ? (
+          isProvisioned ? (
+            <div className="flex w-full flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className={cn("flex h-7 w-7 shrink-0 items-center justify-center rounded-full border", provisioningRun?.state === "partial" ? (isLight ? "border-amber-200 bg-amber-50 text-amber-700" : "border-amber-300/25 bg-amber-300/10 text-amber-100") : (isLight ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-emerald-300/25 bg-emerald-300/10 text-emerald-100"))}>
+                  <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                </span>
+                <div className="min-w-0">
+                  <p className={cn("truncate text-xs font-semibold", isLight ? "text-[#55483e]" : "text-slate-100")}>{provisioningRun?.state === "partial" ? "Workspace is live" : "Workspace ready"}</p>
+                  <p className={cn("truncate text-[10px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{provisioningRun?.state === "partial" ? "Finish optional setup whenever you are ready." : "Open it to start working."}</p>
+                </div>
+              </div>
+              <div className="flex w-full items-center gap-2 sm:w-auto">
+                {provisioningRun?.environmentPreparation.retryable ? <Button type="button" variant="secondary" onClick={() => void provision({ retryEnvironmentPreparation: true })} disabled={!nativeEnvironmentPreparationReady} title={!nativeEnvironmentPreparationReady ? nativeEnvironmentPreparationMessage : undefined} aria-label="Retry native environment preparation" className={cn(missionControlDialogButtonClassName("secondary", surfaceTheme), "h-10 flex-1 sm:h-8 sm:flex-none")}>Retry preparation</Button> : null}
+                <Button type="button" variant="secondary" onClick={() => handleDialogOpenChange(false)} aria-label="Close workspace ready screen" className={cn(missionControlDialogButtonClassName("secondary", surfaceTheme), "h-10 flex-1 sm:h-8 sm:flex-none")}>Close</Button>
+                <Button type="button" onClick={openProvisionedWorkspace} aria-label="Open Workspace" className={cn(missionControlDialogButtonClassName("primary", surfaceTheme), "h-10 flex-1 sm:h-8 sm:flex-none")}><FolderOpen className="mr-1.5 h-3.5 w-3.5" />Open Workspace</Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex w-full items-center justify-between gap-3">
+              <div className="flex items-center gap-1">
+                <Button type="button" variant="ghost" onClick={() => setStage("intake")} className={cn("h-9 px-2 text-xs", isLight ? "text-[#766e64]" : "text-slate-400")}>
+                  <ChevronLeft className="mr-1.5 h-4 w-4" />
+                  Back to brief
+                </Button>
+                <Button type="button" variant="ghost" onClick={() => { setStartOverError(null); setShowStartOverConfirmation(true); }} className={cn("h-9 px-2 text-xs", isLight ? "text-[#9a6d45]" : "text-violet-200/80")}>Start over</Button>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <span className={cn("text-[10px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{isEnrichmentReview ? "Review the proposed updates, then apply them." : "Review the draft, then create the workspace."}</span>
+                <div className="flex items-center gap-2">
+                  <Button type="button" variant="secondary" onClick={() => setIsCustomizing((current) => !current)} className={missionControlDialogButtonClassName("secondary", surfaceTheme)}>
+                    <Pencil className="mr-1.5 h-3.5 w-3.5" />
+                    Customize
+                  </Button>
+                  {!(provisioningRun?.state === "failed" || provisioningError) ? (
+                    <Button
+                      type="button"
+                      disabled={!result || !reviewReadiness?.provisionable || !nativeEnvironmentPreparationReady}
+                      onClick={() => void provision()}
+                      title={!result || !reviewReadiness?.provisionable ? reviewReadiness?.message || "The workspace review is not ready to create." : !nativeEnvironmentPreparationReady ? nativeEnvironmentPreparationMessage : undefined}
+                      aria-label={isEnrichmentReview ? "Apply workspace updates" : "Create Workspace"}
+                      className={missionControlDialogButtonClassName("primary", surfaceTheme)}
+                    >
+                      {isEnrichmentReview ? "Apply updates" : "Create Workspace"}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          )
+        ) : (
+          <div className="flex w-full items-center justify-end gap-3">
+            <Button
+              type="button"
+              disabled={!brief.trim()}
+              onClick={() => void generate()}
+              className={missionControlDialogButtonClassName("primary", surfaceTheme) + " h-10 px-4 text-sm"}
+            >
+              <WandSparkles className="mr-2 h-4 w-4" />
+              Create workspace
+            </Button>
+          </div>
+        )
+      }
+    >
+      <div className={cn("min-h-0 h-full overflow-y-auto", isLight ? "bg-[#fbf8f3]" : "bg-[hsl(var(--agentos-surface-panel))]")}>
+        {stage === "intake" ? (
+          <IntakeView
+            isLight={isLight}
+            brief={brief}
+            setBrief={setBrief}
+            profile={profile}
+            setProfile={setProfile}
+            environmentPreparation={environmentPreparation}
+            setEnvironmentPreparation={setEnvironmentPreparation}
+            nativeEnvironmentTopology={nativeEnvironmentTopology}
+            nativeEnvironmentInventoryState={nativeEnvironmentInventoryState}
+            nativeEnvironmentInventoryError={nativeEnvironmentInventoryError}
+            onRefreshNativeEnvironmentInventory={() => setNativeEnvironmentInventoryRefresh((value) => value + 1)}
+            continueLearningAfterCreation={continueLearningAfterCreation}
+            setContinueLearningAfterCreation={setContinueLearningAfterCreation}
+            constraints={constraints}
+            setConstraints={setConstraints}
+            sources={sources}
+            sourceStates={sourceStates}
+            contextAction={contextAction}
+            setContextAction={(next) => { setContextAction(next); setSourceError(null); setSourceDraft({ kind: next === "github" ? "repository" : "website", value: "" }); }}
+            sourceDraft={sourceDraft}
+            setSourceDraft={setSourceDraft}
+            sourceError={sourceError}
+            addUrlSource={addUrlSource}
+            onBrowseFiles={() => fileInputRef.current?.click()}
+            onBrowseFolder={() => folderInputRef.current?.click()}
+            onRemoveSource={removeSource}
+            onFiles={(files) => void handleFiles(files, "file")}
+            onFolder={(files) => void handleFiles(files, "folder")}
+            fileInputRef={fileInputRef}
+            folderInputRef={folderInputRef}
+            notice={notice}
+          />
+        ) : stage === "generating" || isProvisioningStarting ? (
+          <CreationProgressView
+            run={creationRun}
+            provisioningStarting={isProvisioningStarting}
+            isLight={isLight}
+            onContinueNow={isProvisioningStarting ? undefined : () => void continueNow()}
+          />
+        ) : stage === "provisioning" ? (
+          <CreationProgressView run={creationRun} provisioning={provisioningRun} isLight={isLight} />
+        ) : isProvisioned ? (
+          <WorkspaceReadyView isLight={isLight} result={result} creationRun={creationRun} provisioningRun={provisioningRun} provisioningError={provisioningError} />
+        ) : (
+          <ReviewView
+            isLight={isLight}
+            profile={reviewProfile}
+            isEnrichmentReview={isEnrichmentReview}
+            model={reviewModel}
+            revisionValue={revisionValue}
+            setRevisionValue={setRevisionValue}
+            onRevise={() => void revise()}
+            isRevising={isRevising}
+            revisionError={revisionError}
+            onRetry={() => { setStage("intake"); void generate(); }}
+            onRetryProvisioning={() => void retryProvisioning()}
+            onOpenModelSetup={openModelSetup}
+            onRefreshProject={() => void refreshProject()}
+            isRefreshingProject={isRefreshingProject}
+            isCustomizing={isCustomizing}
+            customName={customName}
+            setCustomName={setCustomName}
+            customPrimaryName={customPrimaryName}
+            setCustomPrimaryName={setCustomPrimaryName}
+            onCloseCustomization={() => setIsCustomizing(false)}
+            onSaveCustomization={() => void saveCustomization()}
+            isSavingCustomization={isSavingCustomization}
+            provisioningRun={provisioningRun}
+            provisioningError={provisioningError}
+            environmentPreparation={environmentPreparation}
+            setEnvironmentPreparation={setEnvironmentPreparation}
+            nativeEnvironmentTopology={nativeEnvironmentTopology}
+            nativeEnvironmentInventoryState={nativeEnvironmentInventoryState}
+            nativeEnvironmentInventoryError={nativeEnvironmentInventoryError}
+            onRefreshNativeEnvironmentInventory={() => setNativeEnvironmentInventoryRefresh((value) => value + 1)}
+            readiness={reviewReadiness ?? creationRun?.snapshot.reviewReadiness ?? null}
+            basicDraftApproved={basicDraftApproved}
+            onApproveBasicDraft={() => void approveBasicDraft()}
+            onRebuildPlan={() => void rebuildPlan()}
+            isRebuildingPlan={isRebuildingPlan}
+            showStartOverConfirmation={showStartOverConfirmation}
+            isStartingOver={isStartingOver}
+            startOverError={startOverError}
+            onKeepDraft={() => setShowStartOverConfirmation(false)}
+            onConfirmStartOver={() => void startOver()}
+          />
+        )}
+      </div>
+      </MissionControlDialogShell>
+    </>
+  );
+}
+
+function IntakeView({
+  isLight,
+  profile,
+  setProfile,
+  environmentPreparation,
+  setEnvironmentPreparation,
+  nativeEnvironmentTopology,
+  nativeEnvironmentInventoryState,
+  nativeEnvironmentInventoryError,
+  onRefreshNativeEnvironmentInventory,
+  continueLearningAfterCreation,
+  setContinueLearningAfterCreation,
+  brief,
+  setBrief,
+  constraints,
+  setConstraints,
+  sources,
+  sourceStates,
+  contextAction,
+  setContextAction,
+  sourceDraft,
+  setSourceDraft,
+  sourceError,
+  addUrlSource,
+  onBrowseFiles,
+  onBrowseFolder,
+  onRemoveSource,
+  onFiles,
+  onFolder,
+  fileInputRef,
+  folderInputRef,
+  notice
+}: {
+  isLight: boolean;
+  profile: WorkspaceCreationDepth;
+  setProfile: (profile: WorkspaceCreationDepth) => void;
+  environmentPreparation: EnvironmentPreparationIntent;
+  setEnvironmentPreparation: (value: EnvironmentPreparationIntent) => void;
+  nativeEnvironmentTopology: ExecutionTopologyProjection | null;
+  nativeEnvironmentInventoryState: NativeEnvironmentInventoryState;
+  nativeEnvironmentInventoryError: string | null;
+  onRefreshNativeEnvironmentInventory: () => void;
+  continueLearningAfterCreation: boolean;
+  setContinueLearningAfterCreation: (value: boolean) => void;
+  brief: string;
+  setBrief: (value: string) => void;
+  constraints: string;
+  setConstraints: (value: string) => void;
+  sources: WorkspaceKnowledgeSource[];
+  sourceStates: Record<string, ContextSourceState>;
+  contextAction: ContextAction;
+  setContextAction: (action: ContextAction) => void;
+  sourceDraft: SourceDraft;
+  setSourceDraft: (draft: SourceDraft) => void;
+  sourceError: string | null;
+  addUrlSource: () => void;
+  onBrowseFiles: () => void;
+  onBrowseFolder: () => void;
+  onRemoveSource: (sourceId: string) => void;
+  onFiles: (files: FileList | null) => void;
+  onFolder: (files: FileList | null) => void;
+  fileInputRef: RefObject<HTMLInputElement | null>;
+  folderInputRef: RefObject<HTMLInputElement | null>;
+  notice: { tone: "warning" | "error" | "muted"; title: string; description: string } | null;
+}) {
+  return (
+    <main className="mx-auto flex min-h-full w-full max-w-[680px] flex-col justify-center px-5 py-6 sm:px-8 sm:py-8">
+      <div className="mb-5">
+        <h1 className="text-2xl font-semibold tracking-tight">What are you working on?</h1>
+      </div>
+
+      {notice ? (
+        <div className={cn("mb-4 rounded-xl border px-4 py-3", notice.tone === "error" ? (isLight ? "border-red-200 bg-red-50 text-red-900" : "border-red-400/20 bg-red-400/10 text-red-100") : notice.tone === "warning" ? (isLight ? "border-amber-200 bg-amber-50 text-amber-900" : "border-amber-400/20 bg-amber-400/10 text-amber-100") : (isLight ? "border-[#e5dbd0] bg-white text-[#65594f]" : "border-white/10 bg-white/[0.04] text-slate-200"))} role="status">
+          <p className="text-sm font-medium">{notice.title}</p>
+          <p className="mt-1 text-xs opacity-80">{notice.description}</p>
+        </div>
+      ) : null}
+
+      <Textarea
+        autoFocus
+        value={brief}
+        onChange={(event) => setBrief(event.target.value)}
+        placeholder="Describe the project, business, team, or job you want AgentOS to work on…"
+        aria-label="What are you working on?"
+        className={cn("min-h-[120px] resize-y rounded-2xl px-5 py-4 text-base leading-7 shadow-none md:min-h-[140px] md:text-[17px]", isLight ? "border-[#ded2c6] bg-white text-[#382d25] placeholder:text-[#aa9a8d] focus-visible:border-[#b8895f] focus-visible:ring-[#b8895f]/20" : "border-white/10 bg-white/[0.055] text-slate-100 placeholder:text-slate-500 focus-visible:border-violet-300/40 focus-visible:ring-violet-300/15")}
+      />
+
+      <div className="mt-4 flex min-w-0 flex-wrap items-center gap-2 pb-1" aria-label="Add project context">
+        <span className={cn("mr-1 shrink-0 text-xs font-medium", isLight ? "text-[#837366]" : "text-slate-500")}>Add context</span>
+        <ContextButton isLight={isLight} icon={Globe} label="Website" onClick={() => setContextAction(contextAction === "website" ? null : "website")} />
+        <ContextButton isLight={isLight} icon={Github} label="GitHub" onClick={() => setContextAction(contextAction === "github" ? null : "github")} />
+        <ContextButton isLight={isLight} icon={FileText} label="Files" onClick={onBrowseFiles} />
+        <ContextButton isLight={isLight} icon={FolderOpen} label="Folder" onClick={onBrowseFolder} />
+
+        <input ref={fileInputRef} type="file" className="hidden" multiple accept={WORKSPACE_KNOWLEDGE_FILE_ACCEPT} onChange={(event) => { onFiles(event.target.files); event.currentTarget.value = ""; }} />
+        <input ref={folderInputRef} type="file" className="hidden" multiple accept={WORKSPACE_KNOWLEDGE_FILE_ACCEPT} {...({ webkitdirectory: "", directory: "" } as Record<string, string>)} onChange={(event) => { onFolder(event.target.files); event.currentTarget.value = ""; }} />
+      </div>
+
+      {contextAction === "website" || contextAction === "github" ? (
+        <div className={cn("mt-2 flex gap-2 rounded-xl border p-2", isLight ? "border-[#e5dbd0] bg-white" : "border-white/10 bg-white/[0.04]")}>
+          <input
+            autoFocus
+            value={sourceDraft.value}
+            onChange={(event) => setSourceDraft({ ...sourceDraft, value: event.target.value })}
+            onKeyDown={(event) => { if (event.key === "Enter") addUrlSource(); }}
+            placeholder={contextAction === "github" ? "github.com/owner/repository" : "https://your-project.com"}
+            aria-label={contextAction === "github" ? "GitHub repository URL" : "Website URL"}
+            className={missionControlDialogControlClassName(isLight ? "border-[#dfd2c6] bg-[#fbf8f3] text-[#382d25] placeholder:text-[#aa9a8d] focus:border-[#b8895f] focus:ring-[#b8895f]/20" : "")}
+          />
+          <Button type="button" onClick={addUrlSource} className={missionControlDialogButtonClassName("primary", isLight ? "light" : "dark")}>Add</Button>
+        </div>
+      ) : null}
+
+
+      {sourceError ? <p className="mt-2 text-xs text-red-500" role="alert">{sourceError}</p> : null}
+
+      {sources.length > 0 ? (
+        <div className="mt-3 flex flex-wrap gap-2" aria-label="Attached context">
+          {sources.map((source) => (
+            <span key={source.id} className={cn("inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs", isLight ? "border-[#e5dbd0] bg-white text-[#55483e]" : "border-white/10 bg-white/[0.05] text-slate-300")}>
+              <span aria-hidden="true">{source.kind === "website" ? "🌐" : source.kind === "repository" ? "◈" : source.kind === "folder" ? "▱" : "▤"}</span>
+              <span className="max-w-[220px] truncate" title={source.label}>{source.label}</span>
+              <SourceStatusIndicator state={sourceStates[source.id]} />
+              <button type="button" onClick={() => onRemoveSource(source.id)} className="ml-0.5 rounded p-0.5 text-current/60 hover:bg-black/5 hover:text-current focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label={`Remove ${source.label}`}><X className="h-3.5 w-3.5" /></button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+
+      <fieldset className="mt-8">
+        <legend className="mb-4 text-sm font-medium">How should AgentOS prepare it?</legend>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {WORKSPACE_CREATION_PROFILES.map((item, index) => (
+            <label key={item.id} className={cn("relative cursor-pointer rounded-xl border p-4 transition-colors focus-within:ring-2 focus-within:ring-violet-400", profile === item.id ? (isLight ? "border-violet-400 bg-violet-50" : "border-violet-400/60 bg-violet-400/10") : (isLight ? "border-black/10 hover:bg-white" : "border-white/10 hover:bg-white/5"))}>
+              <input type="radio" name="creation-profile" value={item.id} checked={profile === item.id} onChange={() => setProfile(item.id)} className="sr-only" />
+              <span className="flex items-center justify-between text-base font-semibold">{item.label}<span aria-hidden="true" className="text-xs tracking-widest text-violet-400">{"•".repeat(index + 1)}</span></span>
+              <span className="mt-1 block text-xs opacity-65">{item.timing}</span>
+              <span className="mt-3 block text-xs">{item.description}</span>
+            </label>
+          ))}
+        </div>
+        <p className="mt-3 min-h-5 text-xs opacity-60">{WORKSPACE_CREATION_PROFILES.find((item) => item.id === profile)?.learns}</p>
+      </fieldset>
+
+      <details className={cn("mt-4 px-1 py-2", isLight ? "border-[#e5dbd0] bg-white/70" : "border-white/10 bg-white/[0.025]")}>
+        <summary className={cn("cursor-pointer text-xs font-medium", isLight ? "text-[#65594f]" : "text-slate-300")}>Advanced options</summary>
+        <div className="mt-4 flex flex-col items-center gap-3">
+          <label className={cn("flex w-full max-w-[600px] items-start gap-2 text-xs", isLight ? "text-[#65594f]" : "text-slate-300", profile === "high" && "opacity-50")}>
+            <input type="checkbox" checked={continueLearningAfterCreation} disabled={profile === "high"} onChange={(event) => setContinueLearningAfterCreation(event.target.checked)} className="mt-0.5 accent-violet-500" />
+            <span><span className="font-medium">Continue learning after creation</span><span className="ml-1 opacity-70">(Fast / Medium)</span><span className="mt-1 block opacity-70">AgentOS will prepare reviewable improvements without changing the workspace automatically.</span></span>
+          </label>
+          <div className="w-full max-w-[600px]">
+            <label htmlFor="workspace-constraints" className={cn("text-xs font-medium", isLight ? "text-[#65594f]" : "text-slate-300")}>Specific constraints <span className="font-normal opacity-60">(optional)</span></label>
+            <Textarea id="workspace-constraints" value={constraints} onChange={(event) => setConstraints(event.target.value)} placeholder="Anything AgentOS should keep in mind? One constraint per line." className={cn("mt-2 min-h-[84px] resize-y text-sm shadow-none", isLight ? "border-[#ded2c6] bg-white text-[#382d25] placeholder:text-[#aa9a8d]" : "border-white/10 bg-white/[0.04] text-slate-100 placeholder:text-slate-500")} />
+          </div>
+          <div className={cn("w-full max-w-[600px] rounded-xl border px-3 py-3", isLight ? "border-[#e5dbd0] bg-[#fcfaf7]" : "border-white/10 bg-white/[0.035]") }>
+            <label className={cn("flex items-start gap-2 text-xs", isLight ? "text-[#65594f]" : "text-slate-300")}>
+              <input type="checkbox" checked={environmentPreparation.requested} onChange={(event) => setEnvironmentPreparation({ ...environmentPreparation, requested: event.target.checked })} className="mt-0.5 accent-violet-500" />
+              <span><span className="font-medium">Prepare a native OpenClaw environment</span><span className="mt-1 block leading-5 opacity-70">Optional and operator-requested. OpenClaw remains responsible for profile validation, placement, lifecycle, cleanup, and provider economics.</span></span>
+            </label>
+            {environmentPreparation.requested ? <NativeEnvironmentProfileSelector
+              isLight={isLight}
+              environmentPreparation={environmentPreparation}
+              setEnvironmentPreparation={setEnvironmentPreparation}
+              topology={nativeEnvironmentTopology}
+              inventoryState={nativeEnvironmentInventoryState}
+              inventoryError={nativeEnvironmentInventoryError}
+              onRefresh={onRefreshNativeEnvironmentInventory}
+            /> : null}
+          </div>
+        </div>
+      </details>
+
+    </main>
+  );
+}
+
+function NativeEnvironmentProfileSelector({
+  isLight,
+  environmentPreparation,
+  setEnvironmentPreparation,
+  topology,
+  inventoryState,
+  inventoryError,
+  onRefresh
+}: {
+  isLight: boolean;
+  environmentPreparation: EnvironmentPreparationIntent;
+  setEnvironmentPreparation: (value: EnvironmentPreparationIntent) => void;
+  topology: ExecutionTopologyProjection | null;
+  inventoryState: NativeEnvironmentInventoryState;
+  inventoryError: string | null;
+  onRefresh: () => void;
+}) {
+  const profiles = inventoryState === "available" ? getNativeEnvironmentProfiles(topology) : [];
+  const selectDisabled = inventoryState !== "available" || profiles.length === 0;
+  const status = getNativeEnvironmentInventoryStatus(inventoryState, profiles.length, inventoryError);
+
+  return (
+    <div className="mt-3 text-xs">
+      <label htmlFor="native-environment-profile" className={cn("block", isLight ? "text-[#65594f]" : "text-slate-300")}>
+        <span className="font-medium">OpenClaw environment profile</span>
+        <select
+          id="native-environment-profile"
+          value={environmentPreparation.profileId}
+          onChange={(event) => setEnvironmentPreparation({ requested: true, profileId: event.target.value })}
+          disabled={selectDisabled}
+          aria-describedby="native-environment-help"
+          className={cn(missionControlDialogControlClassName("mt-1.5 h-10"), isLight ? "border-[#dfd2c6] bg-white text-[#382d25]" : "")}
+        >
+          <option value="">Select an authorized native profile</option>
+          {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.id}</option>)}
+        </select>
+      </label>
+      <div className="mt-1.5 flex items-start justify-between gap-3" role="status" aria-live="polite">
+        <span className={cn("leading-5", status.tone === "attention" ? (isLight ? "text-amber-800" : "text-amber-100") : isLight ? "text-[#9b8d80]" : "text-slate-500")}>{status.message}</span>
+        {inventoryState !== "idle" && inventoryState !== "loading" ? <Button type="button" variant="secondary" onClick={onRefresh} aria-label="Refresh native OpenClaw profile inventory" className={cn(missionControlDialogButtonClassName("secondary", isLight ? "light" : "dark"), "h-8 shrink-0 px-2.5 text-[11px]")}><RefreshCw className="mr-1.5 h-3 w-3" />Refresh</Button> : null}
+      </div>
+      <span id="native-environment-help" className={cn("mt-1.5 block leading-5", isLight ? "text-[#9b8d80]" : "text-slate-500")}>Only profiles currently returned by the authorized OpenClaw native inventory can be selected. Credentials and provider secrets are never shown.</span>
+    </div>
+  );
+}
+
+function getNativeEnvironmentProfiles(topology: ExecutionTopologyProjection | null) {
+  return topology?.sourceStatus === "available"
+    ? topology.profiles.filter((profile) => profile.id.trim().length > 0)
+    : [];
+}
+
+function getNativeEnvironmentPreparationMessage(
+  environmentPreparation: EnvironmentPreparationIntent,
+  inventoryState: NativeEnvironmentInventoryState,
+  topology: ExecutionTopologyProjection | null,
+  inventoryError: string | null
+) {
+  if (!environmentPreparation.requested) return "Native environment preparation is optional.";
+  switch (inventoryState) {
+    case "idle": return "Load the authorized native profile inventory before requesting preparation.";
+    case "loading": return "Loading the authorized native OpenClaw profile inventory…";
+    case "denied": return "Access to the native OpenClaw profile inventory was denied. Preparation stays disabled.";
+    case "unsupported": return "Native profile inventory is unavailable or unsupported in this OpenClaw runtime. Preparation stays disabled.";
+    case "degraded": return "The native OpenClaw profile inventory could not be verified. Preparation stays disabled until it is available.";
+    case "unavailable": return inventoryError || "The native OpenClaw profile inventory is unavailable. Preparation stays disabled.";
+    case "empty": return "OpenClaw reported no native environment profiles. Preparation stays disabled.";
+    case "available":
+      return environmentPreparation.profileId && getNativeEnvironmentProfiles(topology).some((profile) => profile.id === environmentPreparation.profileId)
+        ? "The selected native profile will be passed to OpenClaw unchanged when you create the workspace."
+        : "Choose an OpenClaw profile from the authorized native inventory to request preparation.";
+  }
+}
+
+function getNativeEnvironmentInventoryStatus(
+  inventoryState: NativeEnvironmentInventoryState,
+  profileCount: number,
+  inventoryError: string | null
+) {
+  switch (inventoryState) {
+    case "loading": return { message: "Loading native OpenClaw profiles…", tone: "muted" as const };
+    case "available": return { message: profileCount ? "Choose a profile reported by OpenClaw." : "No native OpenClaw profiles are available.", tone: profileCount ? "muted" as const : "attention" as const };
+    case "empty": return { message: "OpenClaw reported an empty native profile inventory. Preparation stays disabled.", tone: "attention" as const };
+    case "denied": return { message: "Access to the native OpenClaw profile inventory was denied. Preparation stays disabled.", tone: "attention" as const };
+    case "unsupported": return { message: "Native profile inventory is unavailable or unsupported in this OpenClaw runtime. Preparation stays disabled.", tone: "attention" as const };
+    case "degraded": return { message: "Native profile inventory could not be verified. Preparation stays disabled.", tone: "attention" as const };
+    case "unavailable": return { message: inventoryError || "Native profile inventory is unavailable. Preparation stays disabled.", tone: "attention" as const };
+    case "idle": return { message: "Native profile inventory has not been requested yet.", tone: "muted" as const };
+  }
+}
+
+function SourceStatusIndicator({ state }: { state?: ContextSourceState }) {
+  const status = state?.status ?? "attached";
+  const label = status === "ready"
+    ? "Context ready"
+    : status === "reading"
+      ? "Reading context"
+      : status === "partial"
+        ? "Partially read"
+        : status === "unsupported"
+          ? "Unsupported format"
+          : status === "error"
+            ? "Could not read"
+            : "Attached; not read yet";
+  return (
+    <span className="inline-flex items-center gap-1" title={state?.warning || label}>
+      {status === "ready" ? <Check className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" /> : status === "reading" ? <LoaderCircle className="h-3.5 w-3.5 animate-spin text-violet-400 motion-reduce:animate-none" aria-hidden="true" /> : <CircleAlert className="h-3.5 w-3.5 text-amber-500" aria-hidden="true" />}
+      <span className="text-[10px] opacity-70">{status === "ready" ? "Ready" : status === "reading" ? "Reading" : status === "partial" ? "Partial" : status === "unsupported" ? "Unsupported" : status === "error" ? "Error" : "Attached"}</span>
+    </span>
+  );
+}
+
+function mapCreationSourceStatus(state: "pending" | "discovering" | "fetching" | "normalizing" | "ready" | "partial" | "failed"): ContextSourceStatus {
+  if (state === "ready") return "ready";
+  if (state === "partial") return "partial";
+  if (state === "failed") return "error";
+  if (state === "pending") return "attached";
+  return "reading";
+}
+
+function CreationProgressView({ run, provisioning, provisioningStarting = false, isLight, onContinueNow }: {
+  run: WorkspaceCreationRun | null; provisioning?: ProvisioningRun | null; provisioningStarting?: boolean; isLight: boolean; onContinueNow?: () => void;
+}) {
+  const progressProvisioning = provisioning ?? (provisioningStarting ? { state: "pending" as const, steps: [] as const } : null);
+  const display = presentWorkspaceCreationDisplay(run, progressProvisioning);
+  const experience = presentWorkspaceCreationExperience({ run, provisioningRun: progressProvisioning });
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  useEffect(() => {
+    const updateClock = () => setClockNow(Date.now());
+    updateClock();
+    const timer = window.setInterval(updateClock, 1_000);
+    return () => window.clearInterval(timer);
+  }, [run?.runId, provisioning?.runId]);
+  const startedAt = run?.createdAt ? Date.parse(run.createdAt) : Number.NaN;
+  const liveElapsedMs = Number.isFinite(startedAt) ? Math.max(0, clockNow - startedAt) : 0;
+  const elapsedMs = Math.max(run?.snapshot.elapsedMs ?? 0, liveElapsedMs);
+  const canExpedite = run && normalizeWorkspaceCreationProfile(run.input.profile) !== "fast" && !run.expediteRequestedAt
+    && (run.snapshot.context.status === "ready" || run.snapshot.context.status === "partial" && run.snapshot.context.usableEvidence);
+  return (
+    <main className="mx-auto flex min-h-full w-full max-w-lg flex-col justify-center px-7 py-10 sm:px-10" aria-busy="true">
+      <div className="flex items-center justify-between gap-3">
+        <p className={cn("flex items-center gap-2 text-xl font-medium tracking-tight", isLight ? "text-[#382d25]" : "text-slate-100")} role="status" aria-live="polite">
+          <LoaderCircle className="size-4 shrink-0 animate-spin text-violet-400 motion-reduce:animate-none" aria-hidden="true" />
+          {display.activity}
+        </p>
+        <span className={cn("shrink-0 text-[11px] tabular-nums", isLight ? "text-[#8f8074]" : "text-slate-500")} aria-label={`Working for ${formatElapsed(elapsedMs)}`}>
+          {formatElapsed(elapsedMs)}
+        </span>
+      </div>
+      <ol className="grid gap-2 sm:grid-cols-2" aria-label="Workspace creation progress" aria-live="polite">
+        {experience.activities.map((activity) => {
+          const isComplete = activity.status === "complete";
+          const isActive = activity.status === "active";
+          return (
+            <li
+              key={activity.id}
+              className={cn(
+                "flex items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-xs transition-colors",
+                isComplete
+                  ? (isLight ? "border-emerald-200 bg-emerald-50/70 text-emerald-900" : "border-emerald-300/20 bg-emerald-300/10 text-emerald-100")
+                  : isActive
+                    ? (isLight ? "border-violet-200 bg-violet-50 text-violet-950" : "border-violet-300/25 bg-violet-300/10 text-violet-100")
+                    : (isLight ? "border-[#e5dbd0] bg-white/70 text-[#8f8074]" : "border-white/10 bg-white/[0.03] text-slate-500")
+              )}
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                {isComplete ? <Check className="size-3.5 shrink-0 text-emerald-500" aria-hidden="true" /> : isActive ? <LoaderCircle className="size-3.5 shrink-0 animate-spin text-violet-400 motion-reduce:animate-none" aria-hidden="true" /> : <span className="size-1.5 shrink-0 rounded-full bg-current opacity-45" aria-hidden="true" />}
+                <span className="truncate">{activity.label}</span>
+              </span>
+              <span className="shrink-0 text-[10px] opacity-70">{isComplete ? "Complete" : isActive ? "Working" : "Next"}</span>
+            </li>
+          );
+        })}
+      </ol>
+      {display.events.length ? (
+        <ul className={cn("mt-5 flex flex-wrap gap-x-5 gap-y-2 text-[11px]", isLight ? "text-[#786b60]" : "text-slate-400")} aria-label="Completed results" aria-live="polite">
+          {display.events.map((event) => <li key={event.label} className="workspace-architect-chip-enter flex items-center gap-1.5 motion-reduce:[animation:none]">
+            <Check className="size-3.5 text-emerald-500" aria-hidden="true" />{event.label}
+          </li>)}
+        </ul>
+      ) : null}
+      {canExpedite && onContinueNow ? <Button variant="ghost" onClick={onContinueNow} className="mt-8 self-start px-0 text-xs opacity-65">Finish with current context</Button> : null}
+    </main>
+  );
+}
+
+function WorkspaceReadyView({
+  isLight,
+  result,
+  creationRun,
+  provisioningRun,
+  provisioningError
+}: {
+  isLight: boolean;
+  result: WorkspaceArchitectResult | null;
+  creationRun: WorkspaceCreationRun | null;
+  provisioningRun: ProvisioningRun | null;
+  provisioningError: string | null;
+}) {
+  const blueprint = result?.blueprint;
+  const workspaceName = blueprint?.identity.name || "Workspace";
+  const workspacePurpose = blueprint?.identity.purpose || "A focused place for your project and AI workforce.";
+  const primaryAgent = blueprint?.workforce.primaryAgent.name || "Primary agent";
+  const agentCount = blueprint ? 1 + blueprint.workforce.specialists.length : null;
+  const sourceCount = creationRun?.input.sources.length ?? 0;
+  const documentCount = provisioningRun?.knowledge?.documentCount ?? null;
+  const isPartial = provisioningRun?.state === "partial";
+  const backgroundLearning = Boolean(
+    creationRun
+      && normalizeWorkspaceCreationProfile(creationRun.input.profile) !== "high"
+      && creationRun.input.continueLearningAfterCreation !== false
+  );
+  const pendingSetup = [
+    { label: "Channels", icon: MessageCircle, values: provisioningRun?.pendingSetup.channels ?? [] },
+    { label: "Connections", icon: Link2, values: provisioningRun?.pendingSetup.connections ?? [] },
+    { label: "Automations", icon: RefreshCw, values: provisioningRun?.pendingSetup.automations ?? [] }
+  ].filter((item) => item.values.length > 0);
+  const pendingCount = pendingSetup.reduce((count, item) => count + item.values.length, 0);
+  const signals = provisioningRun?.signals.slice(0, 6) ?? [];
+  const environment = provisioningRun?.environmentPreparation;
+  const environmentComplete = environment?.status === "prepared" || environment?.status === "reused";
+  const metrics = [
+    { icon: Bot, value: agentCount === null ? "—" : String(agentCount), label: agentCount === 1 ? "AI agent" : "AI workforce" },
+    { icon: Globe, value: String(sourceCount), label: sourceCount === 1 ? "Project source" : "Project sources" },
+    ...(documentCount === null ? [] : [{ icon: FileText, value: String(documentCount), label: documentCount === 1 ? "Knowledge document" : "Knowledge documents" }])
+  ];
+
+  return (
+    <main className="mx-auto flex min-h-full w-full max-w-[900px] flex-col px-5 py-6 md:px-10 md:py-7">
+      <div className="mb-4 flex items-center justify-between gap-3 px-1">
+        <div className={cn("flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.2em]", isLight ? "text-[#9a7a62]" : "text-violet-200/70")}>
+          <span className={cn("flex h-6 w-6 items-center justify-center rounded-full border", isPartial ? (isLight ? "border-amber-200 bg-amber-50 text-amber-700" : "border-amber-300/25 bg-amber-300/10 text-amber-100") : (isLight ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-emerald-300/25 bg-emerald-300/10 text-emerald-100"))}>
+            <Check className="h-3.5 w-3.5" aria-hidden="true" />
+          </span>
+          Workspace created
+        </div>
+        <span className={cn("text-[10px] font-medium", isPartial ? "text-amber-600" : isLight ? "text-[#9b8d80]" : "text-slate-500")}>
+          {isPartial ? "Setup can continue later" : "Ready to open"}
+        </span>
+      </div>
+
+      <section
+        className={cn(
+          "workspace-architect-card-enter relative overflow-hidden rounded-[28px] border shadow-[0_24px_70px_rgba(60,42,28,0.12)]",
+          isLight
+            ? "border-[#e7d8c8] bg-[radial-gradient(circle_at_82%_12%,rgba(217,180,146,0.24),transparent_34%),linear-gradient(135deg,#fffdfa,#f7efe6)]"
+            : "border-violet-300/20 bg-[radial-gradient(circle_at_82%_12%,rgba(139,92,246,0.22),transparent_34%),linear-gradient(135deg,rgba(30,24,49,0.96),rgba(13,17,29,0.98))] shadow-[0_24px_70px_rgba(0,0,0,0.28)]"
+        )}
+        aria-labelledby="workspace-ready-heading"
+      >
+        <div className="pointer-events-none absolute -left-16 -top-20 h-48 w-48 rounded-full border border-white/20 opacity-40" aria-hidden="true" />
+        <div className="relative grid items-center gap-3 px-5 py-6 sm:grid-cols-[minmax(0,1fr)_228px] sm:gap-7 sm:px-7 sm:py-7">
+          <div className="order-2 min-w-0 sm:order-1">
+            <p className={cn("text-[10px] font-semibold uppercase tracking-[0.2em]", isLight ? "text-[#9a7a62]" : "text-violet-200/70")}>{isPartial ? "Live with setup pending" : "Your workspace is ready"}</p>
+            <h1 id="workspace-ready-heading" className={cn("mt-2 break-words font-display text-[clamp(2rem,5vw,3.2rem)] font-semibold leading-[0.98] tracking-[-0.055em]", isLight ? "text-[#32271f]" : "text-white")}>{workspaceName}</h1>
+            <p className={cn("mt-4 max-w-xl text-sm leading-6", isLight ? "text-[#766e64]" : "text-slate-300")}>{workspacePurpose}</p>
+            <div className="mt-5 flex flex-wrap gap-2">
+              <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium", isPartial ? (isLight ? "border-amber-200 bg-amber-50 text-amber-800" : "border-amber-300/25 bg-amber-300/10 text-amber-100") : (isLight ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-emerald-300/25 bg-emerald-300/10 text-emerald-100"))}>
+                <Check className="h-3 w-3" aria-hidden="true" />{isPartial ? "Core workspace live" : "Provisioned successfully"}
+              </span>
+              <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium", isLight ? "border-[#e5d7c9] bg-white/70 text-[#6d5c4e]" : "border-white/10 bg-white/[0.06] text-slate-300")}>
+                <Bot className="h-3 w-3" aria-hidden="true" />{primaryAgent}
+              </span>
+            </div>
+          </div>
+
+          <div className="order-1 flex justify-center sm:order-2" role="img" aria-label={`Workspace ready with ${primaryAgent} and project knowledge`}>
+            <div className="relative flex h-[188px] w-[188px] items-center justify-center sm:h-[210px] sm:w-[210px]">
+              <div className={cn("absolute inset-[5%] rounded-full border border-dashed animate-[spin_28s_linear_infinite] motion-reduce:animate-none", isLight ? "border-[#bd9677]/45" : "border-violet-200/25")} aria-hidden="true" />
+              <div className={cn("absolute inset-[18%] rounded-full border", isLight ? "border-[#c9a887]/35" : "border-violet-200/20")} aria-hidden="true" />
+              <div className={cn("absolute inset-[30%] rounded-full", isLight ? "bg-[#c89e73]/12 shadow-[0_0_50px_rgba(184,137,95,0.24)]" : "bg-violet-400/10 shadow-[0_0_60px_rgba(139,92,246,0.28)]")} aria-hidden="true" />
+              <span className={cn("absolute left-[7%] top-[30%] flex h-9 w-9 items-center justify-center rounded-full border shadow-sm", isLight ? "border-[#dfc7b0] bg-[#fffaf4] text-[#9a6d45]" : "border-violet-200/25 bg-[#20183a] text-violet-200")} aria-hidden="true"><Bot className="h-4 w-4" /></span>
+              <span className={cn("absolute bottom-[7%] right-[20%] flex h-8 w-8 items-center justify-center rounded-full border shadow-sm", isLight ? "border-[#dfc7b0] bg-[#fffaf4] text-[#9a6d45]" : "border-violet-200/25 bg-[#20183a] text-violet-200")} aria-hidden="true"><FileText className="h-3.5 w-3.5" /></span>
+              <span className={cn("absolute right-[3%] top-[21%] flex h-7 w-7 items-center justify-center rounded-full border shadow-sm", isLight ? "border-[#dfc7b0] bg-[#fffaf4] text-[#9a6d45]" : "border-violet-200/25 bg-[#20183a] text-violet-200")} aria-hidden="true"><Sparkles className="h-3.5 w-3.5" /></span>
+              <div className={cn("relative z-10 flex h-[84px] w-[84px] items-center justify-center rounded-full border shadow-[0_18px_40px_rgba(82,55,35,0.18)]", isPartial ? (isLight ? "border-amber-300 bg-amber-50 text-amber-700" : "border-amber-200/40 bg-amber-300/15 text-amber-100") : (isLight ? "border-emerald-300 bg-emerald-50 text-emerald-700" : "border-emerald-200/35 bg-emerald-300/15 text-emerald-100"))}>
+                <Check className="h-9 w-9" strokeWidth={1.8} aria-hidden="true" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className={cn("relative border-t px-5 py-3.5 sm:px-7", isLight ? "border-[#eadfd3] bg-white/45" : "border-white/[0.08] bg-black/10")}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className={cn("text-[10px] font-semibold uppercase tracking-[0.18em]", isLight ? "text-[#9a7a62]" : "text-violet-200/65")}>What came online</p>
+            <span className={cn("text-[10px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>OpenClaw workspace · AgentOS control layer</span>
+          </div>
+          {signals.length ? <div className="mt-2 flex flex-wrap gap-1.5">{signals.map((signal, index) => <span key={`${signal}-${index}`} className={cn("workspace-architect-chip-enter inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] motion-reduce:[animation:none]", isLight ? "border-[#e5d7c9] bg-white/70 text-[#6d5c4e]" : "border-white/10 bg-white/[0.045] text-slate-300")} style={{ animationDelay: `${index * 55}ms` }}>{signal}</span>)}</div> : <p className={cn("mt-2 text-xs", isLight ? "text-[#766e64]" : "text-slate-400")}>The core workspace and its first AI agent are ready for your next move.</p>}
+        </div>
+      </section>
+
+      <section className={cn("mt-4 grid gap-2.5", metrics.length === 3 ? "sm:grid-cols-3" : "sm:grid-cols-2")} aria-label="Workspace creation summary">
+        {metrics.map(({ icon: Icon, value, label }) => <div key={label} className={cn("flex items-center gap-3 rounded-2xl border px-4 py-3", isLight ? "border-[#e9dfd5] bg-white text-[#55483e]" : "border-white/[0.08] bg-white/[0.035] text-slate-200")}><span className={cn("flex h-8 w-8 shrink-0 items-center justify-center rounded-xl", isLight ? "bg-[#f7eee5] text-[#9a6d45]" : "bg-violet-400/10 text-violet-200")}><Icon className="h-4 w-4" aria-hidden="true" /></span><span className="min-w-0"><span className="block text-base font-semibold tabular-nums">{value}</span><span className={cn("block truncate text-[10px] uppercase tracking-[0.12em]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{label}</span></span></div>)}
+      </section>
+
+      {environment?.requested ? (
+        <section className={cn("mt-4 rounded-2xl border px-4 py-4", environmentComplete ? (isLight ? "border-emerald-200 bg-emerald-50/60" : "border-emerald-300/20 bg-emerald-300/10") : (isLight ? "border-amber-200 bg-amber-50/70" : "border-amber-300/20 bg-amber-300/10"))} aria-labelledby="native-environment-heading">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-2.5">
+              <span className={cn("mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg", environmentComplete ? (isLight ? "bg-white text-emerald-700" : "bg-emerald-200/10 text-emerald-100") : (isLight ? "bg-white text-amber-700" : "bg-amber-200/10 text-amber-100"))}>{environmentComplete ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : <CircleAlert className="h-3.5 w-3.5" aria-hidden="true" />}</span>
+              <div className="min-w-0"><h2 id="native-environment-heading" className={cn("text-xs font-semibold", environmentComplete ? (isLight ? "text-emerald-950" : "text-emerald-50") : (isLight ? "text-amber-950" : "text-amber-50"))}>Native OpenClaw environment</h2><p className={cn("mt-1 text-xs leading-5", environmentComplete ? (isLight ? "text-emerald-900/75" : "text-emerald-100/75") : (isLight ? "text-amber-900/80" : "text-amber-100/80"))}>{environmentStatusLabel(environment.status, environment.reused)}{environment.location !== "unknown" ? ` · ${environment.location}` : ""}</p></div>
+            </div>
+            <span className={cn("shrink-0 text-[10px] font-medium", environmentComplete ? "text-emerald-600" : "text-amber-600")}>{environment.status === "in-progress" ? "In progress" : environmentComplete ? "Ready" : "Needs attention"}</span>
+          </div>
+          <p className={cn("mt-3 text-xs leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>{environment.error?.message || environment.cost.detail}</p>
+          {environment.environmentId ? <details className="mt-3 text-[11px]"><summary className={cn("cursor-pointer font-medium", isLight ? "text-[#76604f]" : "text-violet-200/80")}>View native recovery identity</summary><p className={cn("mt-2 leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>Environment ID: <span className="font-mono">{environment.environmentId}</span>. The preparation key is retained in the durable provisioning record for recovery.</p></details> : null}
+        </section>
+      ) : null}
+
+      <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
+        <section className={cn("rounded-2xl border px-4 py-4", isLight ? "border-[#e9dfd5] bg-white" : "border-white/[0.08] bg-white/[0.035]")} aria-labelledby="workspace-next-step-heading">
+          <div className="flex items-center gap-2"><span className={cn("flex h-7 w-7 items-center justify-center rounded-lg", isLight ? "bg-[#f7eee5] text-[#9a6d45]" : "bg-violet-400/10 text-violet-200")}><FolderOpen className="h-3.5 w-3.5" aria-hidden="true" /></span><h2 id="workspace-next-step-heading" className={cn("text-xs font-semibold", isLight ? "text-[#55483e]" : "text-slate-100")}>Your workspace is yours now</h2></div>
+          <p className={cn("mt-3 text-xs leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>Open the workspace to meet your AI workforce, inspect the canvas, and make the next decision from one place.</p>
+        </section>
+
+        {pendingCount ? (
+          <section className={cn("rounded-2xl border px-4 py-4", isLight ? "border-amber-200 bg-amber-50/70" : "border-amber-300/20 bg-amber-300/10")} aria-labelledby="workspace-pending-setup-heading">
+            <div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2"><span className={cn("flex h-7 w-7 items-center justify-center rounded-lg", isLight ? "bg-white text-amber-700" : "bg-amber-200/10 text-amber-100")}><CircleAlert className="h-3.5 w-3.5" aria-hidden="true" /></span><h2 id="workspace-pending-setup-heading" className={cn("text-xs font-semibold", isLight ? "text-amber-950" : "text-amber-50")}>Finish setup when ready</h2></div><span className="text-[10px] font-medium text-amber-600">{pendingCount} pending</span></div>
+            <div className="mt-3 space-y-2">{pendingSetup.map(({ label, icon: Icon, values }) => <div key={label} className="flex items-start gap-2 text-xs"><Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-75" aria-hidden="true" /><span className="min-w-0"><span className="font-medium">{label}</span><span className="ml-1 opacity-75">· {values.slice(0, 2).join(" · ")}{values.length > 2 ? ` · +${values.length - 2} more` : ""}</span></span></div>)}</div>
+          </section>
+        ) : backgroundLearning ? (
+          <section className={cn("rounded-2xl border px-4 py-4", isLight ? "border-[#e9dfd5] bg-[#fcfaf7]" : "border-white/[0.08] bg-white/[0.025]")} aria-labelledby="workspace-learning-heading">
+            <div className="flex items-center gap-2"><span className={cn("flex h-7 w-7 items-center justify-center rounded-lg", isLight ? "bg-[#f7eee5] text-[#9a6d45]" : "bg-violet-400/10 text-violet-200")}><Sparkles className="h-3.5 w-3.5" aria-hidden="true" /></span><h2 id="workspace-learning-heading" className={cn("text-xs font-semibold", isLight ? "text-[#55483e]" : "text-slate-100")}>Background learning is on</h2></div>
+            <p className={cn("mt-3 text-xs leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>AgentOS may prepare reviewable improvements, but nothing changes automatically.</p>
+          </section>
+        ) : (
+          <section className={cn("rounded-2xl border px-4 py-4", isLight ? "border-emerald-200 bg-emerald-50/60" : "border-emerald-300/20 bg-emerald-300/10")} aria-labelledby="workspace-complete-heading">
+            <div className="flex items-center gap-2"><span className={cn("flex h-7 w-7 items-center justify-center rounded-lg", isLight ? "bg-white text-emerald-700" : "bg-emerald-200/10 text-emerald-100")}><Check className="h-3.5 w-3.5" aria-hidden="true" /></span><h2 id="workspace-complete-heading" className={cn("text-xs font-semibold", isLight ? "text-emerald-950" : "text-emerald-50")}>Everything required is in place</h2></div>
+            <p className={cn("mt-3 text-xs leading-5", isLight ? "text-emerald-900/75" : "text-emerald-100/75")}>Your workspace is ready for real work.</p>
+          </section>
+        )}
+      </div>
+
+      {provisioningError ? <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">{provisioningError}</p> : null}
+    </main>
+  );
+}
+
+function environmentStatusLabel(status: ProvisioningRun["environmentPreparation"]["status"], reused: boolean | null) {
+  if (status === "prepared") return "Prepared by OpenClaw";
+  if (status === "reused" || reused) return "Reused by OpenClaw";
+  if (status === "pending") return "Waiting for OpenClaw";
+  if (status === "in-progress") return "OpenClaw is still preparing it";
+  if (status === "unsupported") return "Native preparation is unavailable";
+  if (status === "blocked") return "Native preparation is blocked";
+  if (status === "unknown") return "Preparation status is unknown";
+  if (status === "failed") return "OpenClaw preparation failed";
+  return "Preparation is partial";
+}
+
+function ReviewView({
+  isLight,
+  profile,
+  isEnrichmentReview,
+  model,
+  revisionValue,
+  setRevisionValue,
+  onRevise,
+  isRevising,
+  revisionError,
+  onRetry,
+  onRetryProvisioning,
+  onOpenModelSetup,
+  onRefreshProject,
+  isRefreshingProject,
+  isCustomizing,
+  customName,
+  setCustomName,
+  customPrimaryName,
+  setCustomPrimaryName,
+  onCloseCustomization,
+  onSaveCustomization,
+  isSavingCustomization,
+  provisioningRun,
+  provisioningError,
+  environmentPreparation,
+  setEnvironmentPreparation,
+  nativeEnvironmentTopology,
+  nativeEnvironmentInventoryState,
+  nativeEnvironmentInventoryError,
+  onRefreshNativeEnvironmentInventory,
+  readiness,
+  basicDraftApproved,
+  onApproveBasicDraft,
+  onRebuildPlan,
+  isRebuildingPlan,
+  showStartOverConfirmation,
+  isStartingOver,
+  startOverError,
+  onKeepDraft,
+  onConfirmStartOver
+}: {
+  isLight: boolean;
+  profile: WorkspaceCreationDepth;
+  isEnrichmentReview: boolean;
+  model: WorkspaceBlueprintReviewModel | null;
+  revisionValue: string;
+  setRevisionValue: (value: string) => void;
+  onRevise: () => void;
+  isRevising: boolean;
+  revisionError: string | null;
+  onRetry: () => void;
+  onRetryProvisioning: () => void;
+  onOpenModelSetup: () => void;
+  onRefreshProject: () => void;
+  isRefreshingProject: boolean;
+  isCustomizing: boolean;
+  customName: string;
+  setCustomName: (value: string) => void;
+  customPrimaryName: string;
+  setCustomPrimaryName: (value: string) => void;
+  onCloseCustomization: () => void;
+  onSaveCustomization: () => void;
+  isSavingCustomization: boolean;
+  provisioningRun: ProvisioningRun | null;
+  provisioningError: string | null;
+  environmentPreparation: EnvironmentPreparationIntent;
+  setEnvironmentPreparation: (value: EnvironmentPreparationIntent) => void;
+  nativeEnvironmentTopology: ExecutionTopologyProjection | null;
+  nativeEnvironmentInventoryState: NativeEnvironmentInventoryState;
+  nativeEnvironmentInventoryError: string | null;
+  onRefreshNativeEnvironmentInventory: () => void;
+  readiness: WorkspaceCreationReviewReadiness | null;
+  basicDraftApproved: boolean;
+  onApproveBasicDraft: () => void;
+  onRebuildPlan: () => void;
+  isRebuildingPlan: boolean;
+  showStartOverConfirmation: boolean;
+  isStartingOver: boolean;
+  startOverError: string | null;
+  onKeepDraft: () => void;
+  onConfirmStartOver: () => void;
+}) {
+  if (!model) return null;
+  const identity = model.identity;
+  const freshnessStatus = model.freshness.status;
+  const showTechnicalFallback = profile === "high";
+  const hasFailedProvisioningAttempt = provisioningRun?.state === "failed" || provisioningRun?.state === "cancelled" || Boolean(provisioningError);
+  const recovery = presentWorkspaceReviewRecovery({
+    readiness,
+    provisioningRun,
+    provisioningError,
+    partialContext: model.partialContext,
+    fallback: model.fallback && showTechnicalFallback,
+    retryAvailable: model.retryAvailable,
+    freshnessStatus
+  });
+  const runRecoveryAction = () => {
+    switch (recovery.action) {
+      case "retry-design":
+        onRetry();
+        break;
+      case "accept-draft":
+        onApproveBasicDraft();
+        break;
+      case "rebuild-plan":
+        onRebuildPlan();
+        break;
+      case "refresh-context":
+        onRefreshProject();
+        break;
+      case "retry-provisioning":
+        onRetryProvisioning();
+        break;
+      case "open-model-setup":
+        onOpenModelSetup();
+        break;
+    }
+  };
+
+  return (
+    <main className="mx-auto w-full max-w-[860px] px-5 py-6 md:px-10 md:py-8">
+      <ReviewStatusCard
+        isLight={isLight}
+        model={model}
+        profile={profile}
+        isEnrichmentReview={isEnrichmentReview}
+        recovery={recovery}
+        basicDraftApproved={basicDraftApproved}
+        isRefreshingProject={isRefreshingProject}
+        isRebuildingPlan={isRebuildingPlan}
+        onApproveBasicDraft={onApproveBasicDraft}
+        onRecoveryAction={runRecoveryAction}
+      />
+
+      {!isEnrichmentReview ? (
+        <details className={cn("mb-5 rounded-2xl border p-4", isLight ? "border-[#e5dbd0] bg-white" : "border-white/10 bg-white/[0.04]")}>
+          <summary className={cn("cursor-pointer list-none text-sm font-semibold", isLight ? "text-[#55483e]" : "text-slate-200")}>Advanced: native OpenClaw environment</summary>
+          <div className="mt-3 space-y-3">
+            <label className="flex items-start gap-2.5 text-xs">
+              <input
+                type="checkbox"
+                checked={environmentPreparation.requested}
+                onChange={(event) => setEnvironmentPreparation({ ...environmentPreparation, requested: event.target.checked })}
+                className="mt-0.5 h-4 w-4 rounded border-slate-300 accent-violet-500"
+              />
+              <span><span className={cn("font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>Prepare a native worker environment for this workspace</span><span className={cn("mt-1 block leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>This is optional. OpenClaw validates the profile and owns placement, lifecycle, cleanup, and provider economics. Nothing is requested until you create the workspace.</span></span>
+            </label>
+            {environmentPreparation.requested ? <NativeEnvironmentProfileSelector
+              isLight={isLight}
+              environmentPreparation={environmentPreparation}
+              setEnvironmentPreparation={setEnvironmentPreparation}
+              topology={nativeEnvironmentTopology}
+              inventoryState={nativeEnvironmentInventoryState}
+              inventoryError={nativeEnvironmentInventoryError}
+              onRefresh={onRefreshNativeEnvironmentInventory}
+            /> : null}
+          </div>
+        </details>
+      ) : null}
+
+      {model.workspaceFiles.length ? (
+        <details className={cn("mb-5 rounded-2xl border p-4", isLight ? "border-[#e5dbd0] bg-white" : "border-white/10 bg-white/[0.04]")}>
+          <summary className={cn("cursor-pointer list-none text-sm font-semibold", isLight ? "text-[#55483e]" : "text-slate-200")}>View workspace plan <span className={cn("ml-2 text-xs font-normal", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{model.workspaceFiles.length} document{model.workspaceFiles.length === 1 ? "" : "s"}</span></summary>
+          <div className="mt-4"><WorkspaceFilesReview isLight={isLight} model={model} /></div>
+        </details>
+      ) : null}
+
+      {isCustomizing ? (
+        <section className={cn("mb-5 rounded-xl border p-4", isLight ? "border-[#e5dbd0] bg-white" : "border-white/10 bg-white/[0.04]")} aria-labelledby="customize-heading">
+          <div className="flex items-start justify-between gap-3"><div><h2 id="customize-heading" className={cn("text-sm font-semibold", isLight ? "text-[#3d3027]" : "text-white")}>Customize the draft</h2><p className={cn("mt-1 text-xs", isLight ? "text-[#84766b]" : "text-slate-400")}>Change the exception; AgentOS keeps the rest of the architecture intact.</p></div><button type="button" onClick={onCloseCustomization} aria-label="Close customization" className="rounded-md p-1 text-muted-foreground hover:bg-muted"><X className="h-4 w-4" /></button></div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs"><span className={cn("font-medium", isLight ? "text-[#65594f]" : "text-slate-300")}>Workspace name</span><input value={customName} onChange={(event) => setCustomName(event.target.value)} className={cn(missionControlDialogControlClassName("mt-1.5"), isLight ? "border-[#dfd2c6] bg-[#fbf8f3] text-[#382d25]" : "")} /></label>
+            <label className="text-xs"><span className={cn("font-medium", isLight ? "text-[#65594f]" : "text-slate-300")}>Primary agent</span><input value={customPrimaryName} onChange={(event) => setCustomPrimaryName(event.target.value)} className={cn(missionControlDialogControlClassName("mt-1.5"), isLight ? "border-[#dfd2c6] bg-[#fbf8f3] text-[#382d25]" : "")} /></label>
+          </div>
+          <div className="mt-4 flex justify-end"><Button type="button" onClick={onSaveCustomization} disabled={isSavingCustomization || !customName.trim() || !customPrimaryName.trim()} className={missionControlDialogButtonClassName("primary", isLight ? "light" : "dark")}>{isSavingCustomization ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" /> : null}{isSavingCustomization ? "Saving…" : "Save changes"}</Button></div>
+        </section>
+      ) : null}
+
+      <section className={cn("rounded-2xl border p-5 md:p-6", isLight ? "border-[#e5dbd0] bg-white" : "border-white/10 bg-white/[0.04]")}>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0"><p className={cn("text-[10px] font-semibold uppercase tracking-[0.2em]", isLight ? "text-[#9a7a62]" : "text-violet-300/75")}>Project</p><h1 className={cn("mt-2 break-words font-display text-2xl font-semibold tracking-[-0.03em]", isLight ? "text-[#32271f]" : "text-white")}>{identity.name}</h1><p className={cn("mt-2 max-w-2xl text-sm leading-6", isLight ? "text-[#766e64]" : "text-slate-300")}>{identity.purpose}</p></div>
+          <Badge variant="muted" className="shrink-0">{identity.projectType}</Badge>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-1.5" aria-label="Project summary">
+          <span className={cn("rounded-full border px-2.5 py-1 text-[10px]", isLight ? "border-[#e4ddd3] bg-[#fcfaf7] text-[#6d645b]" : "border-white/10 bg-white/[0.045] text-slate-300")}>{model.sourceSummary.sourceCount} source{model.sourceSummary.sourceCount === 1 ? "" : "s"}</span>
+          <span className={cn("rounded-full border px-2.5 py-1 text-[10px]", isLight ? "border-[#e4ddd3] bg-[#fcfaf7] text-[#6d645b]" : "border-white/10 bg-white/[0.045] text-slate-300")}>{model.sourceSummary.factCount} claim{model.sourceSummary.factCount === 1 ? "" : "s"}</span>
+          <span className={cn("rounded-full border px-2.5 py-1 text-[10px]", isLight ? "border-[#e4ddd3] bg-[#fcfaf7] text-[#6d645b]" : "border-white/10 bg-white/[0.045] text-slate-300")}>{model.sourceSummary.resourceCount} resource{model.sourceSummary.resourceCount === 1 ? "" : "s"}</span>
+          {model.workspaceFiles.length ? <span className={cn("rounded-full border px-2.5 py-1 text-[10px]", isLight ? "border-[#e4ddd3] bg-[#fcfaf7] text-[#6d645b]" : "border-white/10 bg-white/[0.045] text-slate-300")}>{model.workspaceFiles.length} planned doc{model.workspaceFiles.length === 1 ? "" : "s"}</span> : null}
+          {model.sourceSummary.conflictCount ? <span className={cn("rounded-full border px-2.5 py-1 text-[10px]", isLight ? "border-amber-200 bg-amber-50 text-amber-800" : "border-amber-300/20 bg-amber-300/10 text-amber-100")}>{model.sourceSummary.conflictCount} conflict{model.sourceSummary.conflictCount === 1 ? "" : "s"}</span> : null}
+        </div>
+
+        {model.projectIntelligence ? (
+          <details className={cn("mt-4 rounded-xl border px-3.5 py-3", isLight ? "border-[#ece3d9] bg-[#fcfaf7]" : "border-white/[0.08] bg-black/10")}>
+            <summary className={cn("cursor-pointer list-none text-xs font-semibold", isLight ? "text-[#55483e]" : "text-slate-200")}>View project evidence <span className={cn("ml-2 font-normal", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{model.sourceSummary.evidenceCount} evidence item{model.sourceSummary.evidenceCount === 1 ? "" : "s"}</span></summary>
+            <div className="mt-4"><ProjectIntelligenceReview isLight={isLight} model={model} /></div>
+          </details>
+        ) : null}
+
+        <div className="mt-6 grid gap-3 sm:grid-cols-2">
+          <ReviewSection isLight={isLight} title="AI Workforce" icon={Bot}>
+            <p className={cn("text-sm font-semibold", isLight ? "text-[#3d3027]" : "text-slate-100")}>{model.primaryAgent.name}</p>
+            <p className={cn("mt-1 text-xs font-medium", isLight ? "text-[#6f5a4a]" : "text-violet-200/75")}>{model.primaryAgent.role}</p>
+            <p className={cn("mt-1 text-xs leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>{model.primaryAgent.purpose}</p>
+            {model.primaryAgent.responsibilities.length ? <p className={cn("mt-3 text-xs leading-5", isLight ? "text-[#71645a]" : "text-slate-300")}>Responsible for {model.primaryAgent.responsibilities.slice(0, 2).join(" and ")}.</p> : null}
+            {model.primaryAgent.outputs.length ? <p className={cn("mt-2 text-xs leading-5", isLight ? "text-[#89796c]" : "text-slate-400")}>Outputs: {model.primaryAgent.outputs.slice(0, 2).join(" · ")}.</p> : null}
+            {model.primaryAgent.justification ? <details className="mt-3 text-xs"><summary className={cn("cursor-pointer font-medium", isLight ? "text-[#76604f]" : "text-violet-200/80")}>Why this agent</summary><p className={cn("mt-2 leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>{model.primaryAgent.justification}</p></details> : null}
+            {model.primaryAgent.skillIds.length || model.primaryAgent.toolIds.length ? <p className={cn("mt-3 text-xs", isLight ? "text-[#766e64]" : "text-slate-300")}>{model.primaryAgent.skillIds.length + model.primaryAgent.toolIds.length} selected {model.primaryAgent.skillIds.length + model.primaryAgent.toolIds.length === 1 ? "capability" : "capabilities"}.</p> : null}
+          </ReviewSection>
+
+          <ReviewSection isLight={isLight} title="Knowledge" icon={FileText}>
+            <div className="mt-2 flex flex-wrap gap-1.5">{model.knowledge.sources.map((source) => <span key={source.id} className={cn("rounded-md px-2 py-1 text-[11px]", isLight ? "bg-[#f6f0e9] text-[#6c5b4e]" : "bg-white/[0.06] text-slate-300")}>{formatWorkspaceSourceKind(source.kind)} · {source.label}</span>)}</div>
+          </ReviewSection>
+        </div>
+
+        <BlueprintSignalRail isLight={isLight} model={model} />
+
+        <details className="mt-5">
+          <summary className={cn("cursor-pointer text-xs font-medium", isLight ? "text-[#76604f]" : "text-violet-200/80")}>View workforce and workspace details</summary>
+          <ReviewDetailSections isLight={isLight} model={model} />
+        </details>
+      </section>
+
+      {showStartOverConfirmation ? (
+        <div className={cn("fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-5", isLight ? "backdrop-blur-sm" : "backdrop-blur-md")} role="dialog" aria-modal="true" aria-labelledby="start-over-heading">
+          <div className={cn("w-full max-w-sm rounded-2xl border p-5 shadow-2xl", isLight ? "border-[#e5dbd0] bg-white text-[#3d3027]" : "border-white/10 bg-[#111827] text-white")}>
+            <h2 id="start-over-heading" className="text-base font-semibold">Start a new workspace?</h2>
+            <p className={cn("mt-2 text-sm", isLight ? "text-[#766e64]" : "text-slate-300")}>This draft will be discarded.</p>
+            <p className={cn("mt-1 text-sm", isLight ? "text-[#766e64]" : "text-slate-300")}>{hasFailedProvisioningAttempt ? "Any partial provisioning remains available for recovery; AgentOS will not delete existing OpenClaw state." : "Nothing has been created yet."}</p>
+            {startOverError ? <p className={cn("mt-3 rounded-lg border px-3 py-2 text-xs", isLight ? "border-red-200 bg-red-50 text-red-900" : "border-red-400/20 bg-red-400/10 text-red-100")} role="alert">{startOverError}</p> : null}
+            <div className="mt-5 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={onKeepDraft} disabled={isStartingOver}>Keep draft</Button><Button type="button" variant="secondary" onClick={onConfirmStartOver} disabled={isStartingOver}>{isStartingOver ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin motion-reduce:animate-none" /> : null}{isStartingOver ? "Starting…" : "Start new workspace"}</Button></div>
+          </div>
+        </div>
+      ) : null}
+
+      <section className={cn("mt-4 rounded-2xl border p-4", isLight ? "border-[#e5dbd0] bg-white" : "border-white/[0.08] bg-white/[0.035]")} aria-labelledby="revision-heading">
+        <div className="flex items-center gap-2"><WandSparkles className={cn("h-4 w-4", isLight ? "text-[#9a6d45]" : "text-violet-300")} /><h2 id="revision-heading" className={cn("text-sm font-semibold", isLight ? "text-[#3d3027]" : "text-white")}>Want to change something?</h2></div>
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row"><input value={revisionValue} onChange={(event) => setRevisionValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") onRevise(); }} placeholder="Keep this to one agent and remove the automation…" aria-label="Tell AgentOS what to change" className={cn(missionControlDialogControlClassName("h-10"), isLight ? "border-[#dfd2c6] bg-[#fbf8f3] text-[#382d25] placeholder:text-[#aa9a8d]" : "")} /><Button type="button" variant="secondary" onClick={onRevise} disabled={!revisionValue.trim() || isRevising} className={missionControlDialogButtonClassName("secondary", isLight ? "light" : "dark")}>{isRevising ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin motion-reduce:animate-none" /> : null}{isRevising ? "Updating…" : "Revise"}</Button></div>
+        {revisionError ? <p className="mt-2 text-xs text-red-500" role="alert">{revisionError}</p> : null}
+      </section>
+    </main>
+  );
+}
+
+function BlueprintSignalRail({ isLight, model }: { isLight: boolean; model: WorkspaceBlueprintReviewModel }) {
+  const signals = buildBlueprintSignals(model);
+  if (!signals.length) return null;
+
+  return (
+    <section className="mt-5 border-t pt-4" style={{ borderColor: isLight ? "rgba(185, 145, 114, 0.18)" : "rgba(255,255,255,0.08)" }} aria-label="Included from your project">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className={cn("text-[10px] font-semibold uppercase tracking-[0.18em]", isLight ? "text-[#9a7a62]" : "text-violet-200/70")}>Included from your project</p>
+        <p className={cn("text-[10px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>Selections surfaced from the brief and staged context</p>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {signals.map((signal, index) => (
+          <span
+            key={signal}
+            className={cn(
+              "workspace-architect-chip-enter inline-flex max-w-full items-center rounded-full border px-2.5 py-1 text-[10px] leading-4 motion-reduce:[animation:none]",
+              index === 0
+                ? (isLight ? "border-[#d8b184] bg-[#f8efe3] text-[#7c5a34]" : "border-violet-300/30 bg-violet-300/10 text-violet-100")
+                : (isLight ? "border-[#e4ddd3] bg-[#fcfaf7] text-[#6d645b]" : "border-white/10 bg-white/[0.045] text-slate-300")
+            )}
+            style={{ animationDelay: `${index * 55}ms` }}
+          >
+            <span className="max-w-[18rem] truncate">{signal}</span>
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ReviewStatusCard({
+  isLight,
+  model,
+  profile,
+  isEnrichmentReview,
+  recovery,
+  basicDraftApproved,
+  isRefreshingProject,
+  isRebuildingPlan,
+  onApproveBasicDraft,
+  onRecoveryAction
+}: {
+  isLight: boolean;
+  model: WorkspaceBlueprintReviewModel;
+  profile: WorkspaceCreationDepth;
+  isEnrichmentReview: boolean;
+  recovery: ReturnType<typeof presentWorkspaceReviewRecovery>;
+  basicDraftApproved: boolean;
+  isRefreshingProject: boolean;
+  isRebuildingPlan: boolean;
+  onApproveBasicDraft: () => void;
+  onRecoveryAction: () => void;
+}) {
+  const toneClasses = recovery.tone === "danger"
+    ? (isLight ? "border-rose-200 bg-rose-50/80 text-rose-950" : "border-rose-300/20 bg-rose-300/10 text-rose-50")
+    : recovery.tone === "warning"
+      ? (isLight ? "border-amber-200 bg-amber-50/80 text-amber-950" : "border-amber-300/20 bg-amber-300/10 text-amber-50")
+      : recovery.tone === "success"
+        ? (isLight ? "border-emerald-200 bg-emerald-50/70 text-emerald-950" : "border-emerald-300/20 bg-emerald-300/10 text-emerald-50")
+        : (isLight ? "border-[#e5dbd0] bg-white text-[#55483e]" : "border-white/10 bg-white/[0.04] text-slate-200");
+  const profileLabel = isEnrichmentReview
+    ? "Review updates"
+    : profile === "high"
+      ? "Full plan"
+      : profile === "medium"
+        ? "Standard plan"
+        : "Essential setup";
+  const actionBusy = (recovery.action === "refresh-context" && isRefreshingProject)
+    || (recovery.action === "rebuild-plan" && isRebuildingPlan)
+    || (recovery.action === "accept-draft" && basicDraftApproved);
+  const actionLabel = recovery.action === "refresh-context" && isRefreshingProject
+    ? "Refreshing…"
+    : recovery.action === "rebuild-plan" && isRebuildingPlan
+      ? "Rebuilding…"
+      : recovery.action === "accept-draft" && basicDraftApproved
+        ? "Draft accepted"
+        : recovery.actionLabel;
+
+  return (
+    <section className={cn("mb-5 rounded-2xl border px-4 py-4 md:px-5", toneClasses)} role={recovery.tone === "danger" ? "alert" : "status"}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] opacity-65">Workspace review</p>
+          <h2 className="mt-1 text-base font-semibold tracking-tight">{recovery.title}</h2>
+          <p className="mt-1 max-w-3xl text-sm leading-5 opacity-80">{recovery.description}</p>
+        </div>
+        <Badge variant={recovery.tone === "danger" ? "danger" : recovery.tone === "warning" ? "warning" : recovery.tone === "success" ? "success" : "muted"} className="shrink-0">{recovery.badge}</Badge>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-1.5" aria-label="Workspace review summary">
+        <span className="rounded-full border border-current/15 px-2.5 py-1 text-[10px] opacity-80">{profileLabel}</span>
+        <span className="rounded-full border border-current/15 px-2.5 py-1 text-[10px] opacity-80">{model.workforce.agentCount} agent{model.workforce.agentCount === 1 ? "" : "s"}</span>
+      </div>
+
+      {recovery.technicalDetail ? (
+        <details className="mt-3 text-xs opacity-75">
+          <summary className="cursor-pointer font-medium">Technical detail</summary>
+          <p className="mt-1 break-words leading-5">{recovery.technicalDetail}</p>
+        </details>
+      ) : null}
+
+      {recovery.action && actionLabel ? (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-current/10 pt-3">
+          <p className="text-xs font-medium opacity-75">Next step</p>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={recovery.action === "accept-draft" ? onApproveBasicDraft : onRecoveryAction}
+            disabled={actionBusy || (recovery.action === "retry-design" && !model.retryAvailable)}
+            className={missionControlDialogButtonClassName("secondary", isLight ? "light" : "dark")}
+          >
+            {actionLabel}
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ProjectIntelligenceReview({ isLight, model }: { isLight: boolean; model: WorkspaceBlueprintReviewModel }) {
+  if (!model.projectIntelligence) return null;
+  const project = model.project;
+  return (
+    <div className="space-y-4" aria-label="Project evidence">
+      {project.keyFacts.length ? <div className="mt-4"><p className={cn("text-[10px] font-semibold uppercase tracking-[0.16em]", isLight ? "text-[#9a7a62]" : "text-violet-200/65")}>Canonical claims</p><div className="mt-2 grid gap-2 sm:grid-cols-2">{project.keyFacts.slice(0, 8).map((fact) => <div key={fact.id} className={cn("rounded-lg border px-3 py-2", isLight ? "border-[#ece3d9] bg-[#fcfaf7]" : "border-white/[0.08] bg-black/10")}><div className="flex items-center justify-between gap-2"><span className={cn("truncate text-xs font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>{humanProjectFactLabel(fact.key)}</span><span className={cn("shrink-0 text-[10px]", fact.conflicted ? "text-amber-500" : fact.verification === "verified" ? "text-emerald-500" : isLight ? "text-[#9b8d80]" : "text-slate-500")}>{fact.verification}{fact.conflicted ? " · Conflict" : ""}</span></div><p className={cn("mt-1 line-clamp-2 text-xs", isLight ? "text-[#807369]" : "text-slate-400")}>{fact.statement}</p></div>)}</div></div> : null}
+      {project.officialResources.length ? <div className="mt-4"><p className={cn("text-[10px] font-semibold uppercase tracking-[0.16em]", isLight ? "text-[#9a7a62]" : "text-violet-200/65")}>Resources analyzed</p><div className="mt-2 flex flex-wrap gap-1.5">{project.officialResources.slice(0, 10).map((resource) => <span key={resource.id} className={cn("max-w-full rounded-md border px-2 py-1 text-[11px]", resource.conflicted ? (isLight ? "border-amber-200 bg-amber-50 text-amber-900" : "border-amber-300/20 bg-amber-300/10 text-amber-100") : resource.verification === "verified" ? (isLight ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-emerald-300/20 bg-emerald-300/10 text-emerald-100") : (isLight ? "border-[#e4ddd3] bg-[#fcfaf7] text-[#6d645b]" : "border-white/10 bg-white/[0.045] text-slate-300"))} title={resource.locator}>{resource.label} · {resource.category} · {resource.verification}{resource.conflicted ? " · Conflict" : ""}</span>)}</div></div> : null}
+      {project.groupedConflicts.length ? <div className={cn("mt-4 rounded-lg border px-3 py-2 text-xs", isLight ? "border-amber-200 bg-amber-50 text-amber-950" : "border-amber-400/20 bg-amber-400/10 text-amber-50")}><span className="font-medium">{project.groupedConflicts.filter((conflict) => conflict.status === "open").length} open project conflict group{project.groupedConflicts.filter((conflict) => conflict.status === "open").length === 1 ? "" : "s"}</span><div className="mt-2 space-y-1">{project.groupedConflicts.slice(0, 4).map((conflict) => <p key={conflict.summary}><span className="font-medium">{conflict.summary}</span>{conflict.count > 1 ? ` · ${conflict.count} related claims` : ""}</p>)}</div><p className="mt-2 opacity-75">Conflicts remain visible without changing claim verification.</p></div> : null}
+      {model.coverage.status !== "none" ? <p className={cn("mt-4 text-[11px]", model.coverage.status === "partial" ? "text-amber-500" : isLight ? "text-[#89796c]" : "text-slate-500")}>{model.coverage.status === "full" ? "Good coverage" : "Limited coverage"}{model.coverage.reason ? ` · ${model.coverage.reason}` : ""}</p> : null}
+    </div>
+  );
+}
+
+function WorkspaceFilesReview({ isLight, model }: { isLight: boolean; model: WorkspaceBlueprintReviewModel }) {
+  if (!model.workspaceFiles.length) return null;
+  return (
+    <div className="divide-y" style={{ borderColor: isLight ? "#ece3d9" : "rgba(255,255,255,0.08)" }}>{model.workspaceFiles.map((artifact) => <div key={artifact.artifactId} className="flex items-start gap-3 py-3 first:pt-0 last:pb-0"><FileText className={cn("mt-0.5 h-4 w-4 shrink-0", artifact.operation === "conflict" ? "text-amber-400" : isLight ? "text-[#9a6d45]" : "text-violet-300")} /><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className={cn("text-sm font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>{artifact.title}</p><span className={cn("text-[10px] uppercase tracking-[0.12em]", artifact.operation === "conflict" ? "text-amber-500" : isLight ? "text-[#9b8d80]" : "text-slate-500")}>{artifact.operation.replace("merge-managed-section", "update")}</span></div><p className={cn("mt-1 truncate text-xs", isLight ? "text-[#807369]" : "text-slate-400")} title={artifact.path}>{artifact.path}</p><p className={cn("mt-1 line-clamp-2 text-xs", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{artifact.preview}</p></div></div>)}</div>
+  );
+}
+
+function buildBlueprintSignals(model: WorkspaceBlueprintReviewModel) {
+  const signals = [
+    ...model.knowledge.sources.map((source) => `${formatWorkspaceSourceKind(source.kind)} · ${source.label}`),
+    ...model.specialists.map((agent) => `Agent · ${agent.name}`),
+    ...model.automations.map((automation) => `Automation · ${automation.name}`),
+    ...model.channels.map((channel) => `Channel · ${channel.name || channel.type}`),
+    ...model.connections.map((connection) => `Connection · ${connection.provider}`),
+    ...model.capabilities.skills.map((skill) => `Skill · ${capabilityLabel(skill.id)}`),
+    ...model.capabilities.tools.map((tool) => `Tool · ${capabilityLabel(tool.id)}`)
+  ];
+  return [...new Set(signals)].slice(0, 12);
+}
+
+function ReviewDetailSections({ isLight, model }: { isLight: boolean; model: WorkspaceBlueprintReviewModel }) {
+  const agentNames = new Map([model.primaryAgent, ...model.specialists].map((agent) => [agent.id, agent.name]));
+  const warnings = [...new Set(model.warnings)].slice(0, 4);
+  const recommendations = [...new Set(model.recommendations)].slice(0, 4);
+  return (
+    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+      {model.capabilities.skills.length || model.capabilities.tools.length ? <ReviewSection isLight={isLight} title="Capabilities" icon={Sparkles}><div className="grid gap-3 sm:grid-cols-2"><div><p className={cn("text-[10px] font-semibold uppercase tracking-[0.14em]", isLight ? "text-[#9a7a62]" : "text-violet-200/65")}>Skills</p><p className={cn("mt-1 text-sm", isLight ? "text-[#55483e]" : "text-slate-200")}>{model.capabilities.skills.length ? model.capabilities.skills.map((item) => capabilityLabel(item.id)).join(" · ") : "None selected"}</p></div><div><p className={cn("text-[10px] font-semibold uppercase tracking-[0.14em]", isLight ? "text-[#9a7a62]" : "text-violet-200/65")}>Tools</p><p className={cn("mt-1 text-sm", isLight ? "text-[#55483e]" : "text-slate-200")}>{model.capabilities.tools.length ? model.capabilities.tools.map((item) => capabilityLabel(item.id)).join(" · ") : "None selected"}</p></div></div></ReviewSection> : null}
+      <ReviewSection isLight={isLight} title="Memory" icon={FileText}><p className={cn("text-sm", isLight ? "text-[#55483e]" : "text-slate-200")}>{model.memory.durableFacts.length ? `${model.memory.durableFacts.length} durable fact${model.memory.durableFacts.length === 1 ? "" : "s"} proposed` : "No custom project memory yet."}</p></ReviewSection>
+      {model.connections.length ? <ReviewSection isLight={isLight} title="Connections" icon={Link2}><div className="space-y-1.5">{model.connections.map((connection) => <p key={connection.id} className={cn("text-sm", isLight ? "text-[#55483e]" : "text-slate-200")}><span className="font-medium">{connection.provider}</span><span className="ml-2 text-xs opacity-70">{connection.status === "recommended" ? "Recommended" : connection.status === "required" ? "Required" : "Selected"}</span></p>)}</div></ReviewSection> : null}
+      {model.specialists.length ? <ReviewSection isLight={isLight} title="Additional agents" icon={Bot}><div className="space-y-3">{model.specialists.map((agent) => <div key={agent.id}><p className={cn("text-sm font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>{agent.name}</p><p className={cn("mt-1 text-xs font-medium", isLight ? "text-[#6f5a4a]" : "text-violet-200/75")}>{agent.role}</p><p className={cn("mt-1 text-xs", isLight ? "text-[#807369]" : "text-slate-400")}>{agent.purpose}</p>{agent.responsibilities.length ? <p className={cn("mt-2 text-xs leading-5", isLight ? "text-[#71645a]" : "text-slate-300")}>Responsible for {agent.responsibilities.slice(0, 2).join(" and ")}.</p> : null}{agent.outputs.length ? <p className={cn("mt-1 text-xs leading-5", isLight ? "text-[#89796c]" : "text-slate-400")}>Outputs: {agent.outputs.slice(0, 2).join(" · ")}.</p> : null}{agent.justification ? <details className="mt-2 text-xs"><summary className={cn("cursor-pointer font-medium", isLight ? "text-[#76604f]" : "text-violet-200/80")}>Why this agent</summary><p className={cn("mt-1 leading-5", isLight ? "text-[#807369]" : "text-slate-400")}>{agent.justification}</p></details> : null}</div>)}</div></ReviewSection> : <QuietReviewLine isLight={isLight} label="Additional agents" value="No additional agents needed." />}
+      {model.workflows.length ? <ReviewSection isLight={isLight} title="Workflows" icon={WandSparkles}><div className="space-y-3">{model.workflows.map((workflow) => <div key={workflow.id}><p className={cn("text-sm font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>{workflow.name}</p><p className={cn("mt-1 text-xs", isLight ? "text-[#807369]" : "text-slate-400")}>{workflow.goal}</p><p className={cn("mt-1 text-[11px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>Trigger: {workflow.trigger} · Owner: {agentNames.get(workflow.ownerAgentId) ?? "Primary agent"}</p>{workflow.outputs.length ? <p className={cn("mt-1 text-[11px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>Output: {workflow.outputs.slice(0, 2).join(" · ")}</p> : null}</div>)}</div></ReviewSection> : null}
+      {model.automations.length ? <ReviewSection isLight={isLight} title="Automations" icon={RefreshCw}><div className="space-y-3">{model.automations.map((automation) => <div key={automation.id}><p className={cn("text-sm font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>{automation.name}</p><p className={cn("mt-1 text-xs", isLight ? "text-[#807369]" : "text-slate-400")}>{automation.mission}</p><p className={cn("mt-1 text-[11px]", isLight ? "text-[#9b8d80]" : "text-slate-500")}>{formatWorkspaceSchedule(automation.scheduleKind, automation.scheduleValue)} · {agentNames.get(automation.agentId) ?? "Primary agent"} · {automation.enabled ? "Enabled" : "Selected"}</p></div>)}</div></ReviewSection> : <QuietReviewLine isLight={isLight} label="Automations" value="No automations added." />}
+      {model.channels.length ? <ReviewSection isLight={isLight} title="Channels" icon={MessageCircle}><div className="space-y-2">{model.channels.map((channel) => <div key={channel.id}><p className={cn("text-sm font-medium", isLight ? "text-[#55483e]" : "text-slate-200")}>{channel.name || channel.type}</p><p className={cn("text-xs", isLight ? "text-[#807369]" : "text-slate-400")}>{formatWorkspaceChannelSetup(channel)}</p></div>)}</div></ReviewSection> : null}
+      <ReviewSection isLight={isLight} title="Sources analyzed" icon={Globe}><p className={cn("text-sm", isLight ? "text-[#55483e]" : "text-slate-200")}>{model.sourceSummary.sourceCount} source{model.sourceSummary.sourceCount === 1 ? "" : "s"} · {model.sourceSummary.evidenceCount} evidence · {model.sourceSummary.factCount} fact{model.sourceSummary.factCount === 1 ? "" : "s"} · {model.sourceSummary.resourceCount} resource{model.sourceSummary.resourceCount === 1 ? "" : "s"}</p><p className={cn("mt-2 text-xs", isLight ? "text-[#807369]" : "text-slate-400")}>{model.coverage.status === "none" ? "No project material was staged." : model.coverage.status === "partial" ? `Limited coverage${model.coverage.reason ? ` · ${model.coverage.reason}` : ""}` : "Good coverage"}</p></ReviewSection>
+      {warnings.length ? <ReviewSection isLight={isLight} title="Warnings" icon={FileText} tone="warning"><div className="space-y-1.5">{warnings.map((warning) => <p key={warning} className="text-xs leading-5">{warning}</p>)}</div></ReviewSection> : null}
+      {recommendations.length ? <ReviewSection isLight={isLight} title="Recommendations" icon={WandSparkles}><div className="space-y-1.5">{recommendations.map((recommendation) => <p key={recommendation} className={cn("text-xs leading-5", isLight ? "text-[#71645a]" : "text-slate-400")}>{recommendation}</p>)}</div></ReviewSection> : null}
+    </div>
+  );
+}
+
+function ReviewSection({ isLight, title, icon: Icon, children, tone = "default" }: { isLight: boolean; title: string; icon: typeof Bot; children: React.ReactNode; tone?: "default" | "warning" }) {
+  return <section className={cn("rounded-xl border p-4", tone === "warning" ? (isLight ? "border-amber-200 bg-amber-50 text-amber-950" : "border-amber-400/20 bg-amber-400/10 text-amber-50") : (isLight ? "border-[#ece3d9] bg-[#fcfaf7]" : "border-white/[0.08] bg-black/10"))}><div className="flex items-center gap-2"><Icon className="h-3.5 w-3.5 opacity-70" /><h3 className="text-[10px] font-semibold uppercase tracking-[0.18em] opacity-70">{title}</h3></div><div className="mt-3">{children}</div></section>;
+}
+
+function QuietReviewLine({ isLight, label, value }: { isLight: boolean; label: string; value: string }) {
+  return <div className={cn("flex items-center justify-between gap-3 rounded-xl px-4 py-3 text-xs", isLight ? "bg-[#fcfaf7] text-[#89796c]" : "bg-black/10 text-slate-500")}><span className="font-medium">{label}</span><span>{value}</span></div>;
+}
+
+function ContextButton({ isLight, icon: Icon, label, onClick }: { isLight: boolean; icon: typeof Globe; label: string; onClick: () => void }) {
+  return <button type="button" onClick={onClick} className={cn("inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", isLight ? "border-[#e5dbd0] bg-white text-[#65594f] hover:border-[#c9ad92] hover:bg-[#fcfaf7]" : "border-white/10 bg-white/[0.04] text-slate-300 hover:border-violet-300/30 hover:bg-violet-400/[0.08] hover:text-white")}><Icon className="h-3.5 w-3.5" />{label}</button>;
+}
+
+function slugify(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "source";
+}
+
+function capabilityLabel(id: string) {
+  return id.split(/[-_]/g).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+}
+
+// `canProvisionBlueprint` used to be the browser's final gate. Server-owned
+// review readiness now owns that decision; keep the name in the compatibility
+// surface only so older source-contract checks remain explicit about the
+// retired client-side heuristic.
+
+function isProvisioningTerminal(state: ProvisioningRun["state"]) {
+  return state === "ready" || state === "partial" || state === "failed" || state === "cancelled";
+}
+
+function wait(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Provisioning polling was cancelled.", "AbortError"));
+    }, { once: true });
+  });
+}
+
+function formatElapsed(value: number) {
+  if (!value || value < 1_000) return "under 1s";
+  return `${Math.round(value / 1_000)}s`;
+}

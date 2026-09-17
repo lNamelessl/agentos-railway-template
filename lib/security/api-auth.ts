@@ -1,0 +1,171 @@
+import { evaluateLocalOperatorRequest } from "@/lib/security/local-operator";
+
+export const AGENTOS_API_TOKEN_ENV = "AGENTOS_API_TOKEN";
+export const AGENTOS_API_TOKEN_COOKIE = "agentos_api_token";
+export const AGENTOS_API_TOKEN_FRAGMENT_KEY = "agentos_token";
+export const AGENTOS_UNSAFE_DISABLE_API_AUTH_ENV = "AGENTOS_UNSAFE_DISABLE_API_AUTH";
+
+export type ApiAuthDecision =
+  | {
+      ok: true;
+    }
+  | {
+      ok: false;
+      status: 401 | 403;
+      code: "api-auth-required" | "unsafe-local-api";
+      message: string;
+    };
+
+export function evaluateAgentOsApiRequest(input: {
+  method: string;
+  url: string;
+  headers: Headers;
+  env?: Record<string, string | undefined>;
+}): ApiAuthDecision {
+  const env = input.env ?? process.env;
+  const configuredToken = env[AGENTOS_API_TOKEN_ENV]?.trim();
+  const unsafeDisableAuth = env[AGENTOS_UNSAFE_DISABLE_API_AUTH_ENV]?.trim() === "1";
+
+  if (unsafeDisableAuth && env.AGENTOS_PACKAGE_RUNTIME !== "1") {
+    const localDecision = evaluateLocalOperatorRequest({
+      method: input.method,
+      url: input.url,
+      headers: input.headers,
+      allowSafeMethods: false,
+      allowTrustedRemote: false
+    });
+
+    return localDecision.ok
+      ? { ok: true }
+      : {
+          ok: false,
+          status: localDecision.status,
+          code: "unsafe-local-api",
+          message: localDecision.message
+        };
+  }
+
+  if (configuredToken) {
+    const providedToken = readBearerToken(input.headers) ?? readApiTokenCookie(input.headers);
+
+    if (providedToken && constantTimeStringEqual(providedToken, configuredToken)) {
+      return evaluateAuthenticatedAgentOsApiRequest({ ...input, env });
+    }
+
+    return {
+      ok: false,
+      status: 401,
+      code: "api-auth-required",
+      message: "AgentOS API authentication is required."
+    };
+  }
+
+  if (env.NODE_ENV === "development") {
+    const localDecision = evaluateLocalOperatorRequest({
+      method: input.method,
+      url: input.url,
+      headers: input.headers,
+      allowSafeMethods: false,
+      allowTrustedRemote: false
+    });
+
+    return localDecision.ok
+      ? { ok: true }
+      : {
+          ok: false,
+          status: localDecision.status,
+          code: "unsafe-local-api",
+          message: localDecision.message
+        };
+  }
+
+  return {
+    ok: false,
+    status: 401,
+    code: "api-auth-required",
+    message: `Set ${AGENTOS_API_TOKEN_ENV} before exposing AgentOS API routes.`
+  };
+}
+
+/**
+ * Returns whether the request presented the configured API token.
+ *
+ * This deliberately does not apply origin or local-network policy. Callers
+ * that use the result for an API boundary must still run the normal request
+ * decision above. The token itself is never returned to application code.
+ */
+export function hasValidAgentOsApiToken(
+  headers: Headers,
+  env: Record<string, string | undefined> = process.env
+) {
+  const configuredToken = env[AGENTOS_API_TOKEN_ENV]?.trim();
+  if (!configuredToken) return false;
+
+  const providedToken = readBearerToken(headers) ?? readApiTokenCookie(headers);
+  return Boolean(providedToken && constantTimeStringEqual(providedToken, configuredToken));
+}
+
+export function evaluateAuthenticatedAgentOsApiRequest(input: {
+  method: string;
+  url: string;
+  headers: Headers;
+  env?: Record<string, string | undefined>;
+}): ApiAuthDecision {
+  const localDecision = evaluateLocalOperatorRequest({
+    method: input.method,
+    url: input.url,
+    headers: input.headers,
+    env: input.env ?? process.env
+  });
+
+  return localDecision.ok
+    ? { ok: true }
+    : {
+        ok: false,
+        status: localDecision.status,
+        code: "unsafe-local-api",
+        message: localDecision.message
+      };
+}
+
+function readBearerToken(headers: Headers) {
+  const authorization = headers.get("authorization")?.trim();
+  const bearerMatch = authorization?.match(/^Bearer\s+(.+)$/i);
+
+  if (bearerMatch?.[1]?.trim()) {
+    return bearerMatch[1].trim();
+  }
+
+  const headerToken = headers.get("x-agentos-api-token")?.trim();
+  return headerToken || null;
+}
+
+function readApiTokenCookie(headers: Headers) {
+  const cookieHeader = headers.get("cookie");
+  if (!cookieHeader) {
+    return null;
+  }
+
+  for (const entry of cookieHeader.split(";")) {
+    const [name, ...valueParts] = entry.trim().split("=");
+    if (name === AGENTOS_API_TOKEN_COOKIE) {
+      const value = valueParts.join("=");
+      return value ? decodeURIComponent(value) : null;
+    }
+  }
+
+  return null;
+}
+
+function constantTimeStringEqual(left: string, right: string) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  let diff = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    diff |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+
+  return diff === 0;
+}

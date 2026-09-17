@@ -1,0 +1,867 @@
+import { renderWorkspaceAgentsMarkdown } from "@/lib/openclaw/domains/workspace-agents-document";
+import type { WorkspaceMaterialization } from "@/lib/agentos/domains/workspace-materialization";
+import type { WorkspaceKnowledgeSource } from "@/lib/agentos/domains/workspace-knowledge";
+import {
+  OPENCLAW_NATIVE_WORKSPACE_CONTEXT_PATHS,
+  OPENCLAW_NATIVE_WORKSPACE_MEMORY_PATHS
+} from "@/lib/openclaw/workspace-bootstrap-files";
+import type {
+  AgentPolicy,
+  PlannerContextSource,
+  PlannerPersistentAgentSpec,
+  WorkspaceCreateRules,
+  WorkspaceDocOverride,
+  WorkspaceSourceMode,
+  WorkspaceTemplate
+} from "@/lib/openclaw/types";
+
+type WorkspaceDocCategory = "core" | "memory" | "docs" | "deliverables";
+
+type WorkspaceScaffoldDocumentSpec = {
+  path: string;
+  title: string;
+  description: string;
+  category: WorkspaceDocCategory;
+  render: (context: WorkspaceScaffoldDocumentContext) => string;
+};
+
+export interface WorkspaceContextResourceSpec {
+  id: string;
+  label: string;
+  relativePath: string;
+  kind: "file";
+  headings: string[];
+}
+
+export interface WorkspaceContextManifestSection {
+  id: string;
+  title: string;
+  description: string;
+  enabled: boolean;
+  resources: WorkspaceContextResourceSpec[];
+}
+
+export interface WorkspaceContextManifest {
+  template: WorkspaceTemplate | null;
+  rules: WorkspaceCreateRules;
+  sections: WorkspaceContextManifestSection[];
+  resources: WorkspaceContextResourceSpec[];
+}
+
+export const WORKSPACE_CONTEXT_CORE_PATHS = OPENCLAW_NATIVE_WORKSPACE_CONTEXT_PATHS;
+
+export const WORKSPACE_CONTEXT_OPTIONAL_PATHS = OPENCLAW_NATIVE_WORKSPACE_MEMORY_PATHS;
+
+export interface WorkspaceScaffoldDocumentContext {
+  name: string;
+  brief?: string;
+  template: WorkspaceTemplate;
+  sourceMode?: WorkspaceSourceMode;
+  materialization?: WorkspaceMaterialization;
+  rules: WorkspaceCreateRules;
+  agents?: Array<Pick<PlannerPersistentAgentSpec, "role" | "name" | "skillId" | "skillIds"> & { policy?: AgentPolicy }>;
+  toolExamples?: string[];
+  docOverrides?: WorkspaceDocOverride[];
+  contextSources?: Array<
+    Pick<PlannerContextSource, "kind" | "label" | "summary" | "confidence" | "url" | "status">
+  >;
+  knowledgeSources?: WorkspaceKnowledgeSource[];
+}
+
+export interface WorkspaceScaffoldDocument {
+  path: string;
+  title: string;
+  description: string;
+  category: WorkspaceDocCategory;
+  baseContent: string;
+  content: string;
+  overridden: boolean;
+}
+
+export interface WorkspaceEditableDocument extends WorkspaceScaffoldDocument {
+  generated: boolean;
+}
+
+const TEMPLATE_LABELS: Record<WorkspaceTemplate, string> = {
+  software: "Software project",
+  frontend: "Frontend app",
+  backend: "Backend/API",
+  research: "Research",
+  content: "Content/Growth"
+};
+
+export function buildWorkspaceScaffoldDocumentPaths(
+  template: WorkspaceTemplate,
+  rules: WorkspaceCreateRules
+) {
+  return buildWorkspaceScaffoldDocumentSpecs(template, rules).map((spec) => spec.path);
+}
+
+export function buildWorkspaceContextResourceSpecs(template?: WorkspaceTemplate | null): WorkspaceContextResourceSpec[] {
+  const specs: WorkspaceContextResourceSpec[] = [
+    {
+      id: "agents",
+      label: "AGENTS.md",
+      relativePath: "AGENTS.md",
+      kind: "file",
+      headings: ["Workspace", "Team", "Tools", "Customize", "Safety defaults", "Daily memory", "Output"]
+    },
+    {
+      id: "soul",
+      label: "SOUL.md",
+      relativePath: "SOUL.md",
+      kind: "file",
+      headings: ["My Purpose", "How I Operate", "My Quirks", "Active Focus"]
+    },
+    {
+      id: "identity",
+      label: "IDENTITY.md",
+      relativePath: "IDENTITY.md",
+      kind: "file",
+      headings: ["Role"]
+    },
+    {
+      id: "user",
+      label: "USER.md",
+      relativePath: "USER.md",
+      kind: "file",
+      headings: ["Operator Profile", "Preferences"]
+    },
+    {
+      id: "memory-md",
+      label: "MEMORY.md",
+      relativePath: "MEMORY.md",
+      kind: "file",
+      headings: ["Current brief", "Stable facts"]
+    },
+    {
+      id: "memory-blueprint",
+      label: "memory/blueprint.md",
+      relativePath: "memory/blueprint.md",
+      kind: "file",
+      headings: ["Outcome", "Constraints", "Unknowns"]
+    },
+    {
+      id: "memory-decisions",
+      label: "memory/decisions.md",
+      relativePath: "memory/decisions.md",
+      kind: "file",
+      headings: ["Template"]
+    },
+    {
+      id: "docs-brief",
+      label: "docs/brief.md",
+      relativePath: "docs/brief.md",
+      kind: "file",
+      headings: ["Objective", "Success signals", "Open questions"]
+    },
+    {
+      id: "docs-architecture",
+      label: "docs/architecture.md",
+      relativePath: "docs/architecture.md",
+      kind: "file",
+      headings: ["Current shape", "Dependencies", "Risks"]
+    },
+    {
+      id: "deliverables-readme",
+      label: "deliverables/README.md",
+      relativePath: "deliverables/README.md",
+      kind: "file",
+      headings: ["Deliverables"]
+    }
+  ];
+
+  if (template === "frontend") {
+    specs.push({
+      id: "docs-ux-notes",
+      label: "docs/ux-notes.md",
+      relativePath: "docs/ux-notes.md",
+      kind: "file",
+      headings: ["UX Notes"]
+    });
+  }
+
+  if (template === "backend") {
+    specs.push({
+      id: "docs-service-map",
+      label: "docs/service-map.md",
+      relativePath: "docs/service-map.md",
+      kind: "file",
+      headings: ["Service Map"]
+    });
+  }
+
+  if (template === "research") {
+    specs.push({
+      id: "docs-research-plan",
+      label: "docs/research-plan.md",
+      relativePath: "docs/research-plan.md",
+      kind: "file",
+      headings: ["Research Plan"]
+    });
+  }
+
+  if (template === "content") {
+    specs.push({
+      id: "docs-content-brief",
+      label: "docs/content-brief.md",
+      relativePath: "docs/content-brief.md",
+      kind: "file",
+      headings: ["Content Brief"]
+    });
+  }
+
+  return specs;
+}
+
+export function buildWorkspaceContextManifest(
+  template: WorkspaceTemplate | null | undefined,
+  rules: WorkspaceCreateRules
+): WorkspaceContextManifest {
+  const resourceSpecs = buildWorkspaceContextResourceSpecs(template ?? null);
+  const resourceMap = new Map(resourceSpecs.map((spec) => [spec.relativePath, spec]));
+
+  const pickResources = (relativePaths: readonly string[]) =>
+    relativePaths.map((relativePath) => resourceMap.get(relativePath)).filter(Boolean) as WorkspaceContextResourceSpec[];
+
+  const sections: WorkspaceContextManifestSection[] = [
+    {
+      id: "core",
+      title: "Core bootstrap",
+      description: "Required for every workspace and shared by all agents.",
+      enabled: true,
+      resources: pickResources(WORKSPACE_CONTEXT_CORE_PATHS)
+    },
+    {
+      id: "memory",
+      title: "Memory",
+      description: "Durable notes and decisions that survive across sessions.",
+      enabled: rules.generateMemory,
+      resources: rules.generateMemory
+        ? pickResources(["MEMORY.md", "memory/blueprint.md", "memory/decisions.md"])
+        : []
+    },
+    {
+      id: "starter",
+      title: "Starter docs",
+      description: "Planning, architecture, and handoff docs used for the first pass.",
+      enabled: rules.generateStarterDocs,
+      resources: rules.generateStarterDocs
+        ? pickResources(
+            [
+              "docs/brief.md",
+              "docs/architecture.md",
+              "deliverables/README.md",
+              ...(template === "frontend"
+                ? ["docs/ux-notes.md"]
+                : template === "backend"
+                  ? ["docs/service-map.md"]
+                  : template === "research"
+                    ? ["docs/research-plan.md"]
+                    : template === "content"
+                      ? ["docs/content-brief.md"]
+                      : [])
+            ]
+          )
+        : []
+    }
+  ];
+
+  return {
+    template: template ?? null,
+    rules,
+    sections,
+    resources: sections.flatMap((section) => section.resources)
+  };
+}
+
+export function buildWorkspaceScaffoldDocuments(context: WorkspaceScaffoldDocumentContext) {
+  const renderContext: WorkspaceScaffoldDocumentContext = {
+    ...context,
+    sourceMode: context.materialization?.mode ?? context.sourceMode ?? "empty",
+    contextSources: context.contextSources ?? context.knowledgeSources?.map(knowledgeSourceToLegacyContextSource)
+  };
+  const specs = buildWorkspaceScaffoldDocumentSpecs(context.template, context.rules);
+  const overrideMap = new Map(normalizeWorkspaceDocOverrides(context.docOverrides).map((entry) => [entry.path, entry.content]));
+
+  return specs.map((spec) => {
+      const baseContent = spec.render(renderContext);
+    const hasOverride = overrideMap.has(spec.path);
+
+    return {
+      path: spec.path,
+      title: spec.title,
+      description: spec.description,
+      category: spec.category,
+      baseContent,
+      content: hasOverride ? overrideMap.get(spec.path) ?? "" : baseContent,
+      overridden: hasOverride
+    } satisfies WorkspaceScaffoldDocument;
+  });
+}
+
+export function buildWorkspaceEditableDocuments(context: WorkspaceScaffoldDocumentContext) {
+  const scaffoldDocuments = buildWorkspaceScaffoldDocuments(context).map(
+    (document) =>
+      ({
+        ...document,
+        generated: true
+      }) satisfies WorkspaceEditableDocument
+  );
+  const scaffoldPathSet = new Set(scaffoldDocuments.map((document) => document.path));
+  const extraDocuments = normalizeWorkspaceDocOverrides(context.docOverrides)
+    .filter((entry) => !scaffoldPathSet.has(entry.path))
+    .map(
+      (entry) =>
+        ({
+          path: entry.path,
+          title: entry.path,
+          description: "Existing workspace file.",
+          category: inferWorkspaceDocCategory(entry.path),
+          baseContent: entry.content,
+          content: entry.content,
+          overridden: false,
+          generated: false
+        }) satisfies WorkspaceEditableDocument
+    );
+
+  return [...scaffoldDocuments, ...extraDocuments];
+}
+
+export function normalizeWorkspaceDocOverrides(overrides?: WorkspaceDocOverride[]) {
+  const byPath = new Map<string, string>();
+
+  for (const override of overrides ?? []) {
+    const path = override.path.trim();
+
+    if (!path) {
+      continue;
+    }
+
+    byPath.set(path, override.content);
+  }
+
+  return Array.from(byPath.entries()).map(([path, content]) => ({
+    path,
+    content
+  }));
+}
+
+export function renderSkillMarkdown(skillId: string, role: string) {
+  switch (skillId) {
+    case "project-builder":
+      return `# Project Builder
+
+Use this skill when implementing changes in the current project.
+
+- Prefer direct code or artifact changes over speculative planning.
+- Respect AGENTS.md (including its ## Tools section), MEMORY.md, and memory/*.md before large edits.
+- Put task-specific artifacts under the current deliverables run folder instead of the workspace root.
+- Verify impact before finishing and leave the workspace in a clearer state.
+`;
+    case "project-reviewer":
+      return `# Project Reviewer
+
+Use this skill when reviewing changes in the current project.
+
+- Prioritize correctness, regressions, edge cases, and missing tests.
+- Prefer concrete findings with file and behavior references.
+- Keep summaries brief after findings.
+`;
+    case "project-tester":
+      return `# Project Tester
+
+Use this skill when validating behavior in the current project.
+
+- Prefer reproducible checks over assumptions.
+- Focus on failures, regressions, missing coverage, and environment constraints.
+- Report exactly what was verified and what could not be verified.
+`;
+    case "project-learner":
+      return `# Project Learner
+
+Use this skill when consolidating durable project knowledge.
+
+- Capture stable conventions, architecture decisions, and delivery notes.
+- Prefer updating MEMORY.md or memory/*.md with concise, durable facts.
+- Avoid ephemeral chatter and duplicated notes.
+`;
+    case "project-browser":
+      return `# Project Browser
+
+Use this skill when validating browser flows in the current workspace.
+
+- Exercise real user paths, not only component-level assumptions.
+- Capture screenshots, repro steps, and UI regressions with concrete evidence.
+- Hand off findings that need code changes back to the implementation agent.
+`;
+    case "project-researcher":
+      return `# Project Researcher
+
+Use this skill when investigating, synthesizing, or pressure-testing a problem space.
+
+- Start with explicit questions, evidence sources, and output goals.
+- Distinguish verified facts from inference.
+- Convert durable findings into MEMORY.md or memory/*.md.
+`;
+    case "project-strategist":
+      return `# Project Strategist
+
+Use this skill when shaping positioning, campaign direction, or editorial priorities.
+
+- Tie recommendations to audience, channel, and measurable goals.
+- Prefer explicit tradeoffs over vague guidance.
+- Save task-specific briefs, plans, and campaign artifacts inside the current deliverables run folder.
+- Leave a clear next-step plan other agents can execute.
+`;
+    case "project-writer":
+      return `# Project Writer
+
+Use this skill when drafting messaging, copy, or narrative assets.
+
+- Write for the target audience and channel rather than internal shorthand.
+- Keep tone and structure consistent with the workspace brief.
+- Save publishable drafts and task-specific docs inside the current deliverables run folder.
+- Flag assumptions that need strategic review before publication.
+`;
+    case "project-analyst":
+      return `# Project Analyst
+
+Use this skill when evaluating results, experiments, or performance signals.
+
+- Prefer measurable baselines and explicit comparisons.
+- Separate observed performance from speculation about causality.
+- Keep task-specific reports and analysis artifacts inside the current deliverables run folder.
+- Write down recommendations that can be actioned by the team.
+`;
+    default:
+      return `# ${role}
+
+Use this skill when operating in the current workspace.
+
+- Stay grounded in the shared workspace context.
+- Produce durable artifacts when the work needs to be handed off.
+- Put task-specific artifacts in the current deliverables run folder and keep notes in memory/.
+`;
+  }
+}
+
+function buildWorkspaceScaffoldDocumentSpecs(
+  template: WorkspaceTemplate,
+  rules: WorkspaceCreateRules
+): WorkspaceScaffoldDocumentSpec[] {
+  const specs: WorkspaceScaffoldDocumentSpec[] = [
+    {
+      path: "AGENTS.md",
+      title: "AGENTS.md",
+      description: "Shared operating instructions for all agents.",
+      category: "core",
+      render: renderAgentsMarkdown
+    },
+    {
+      path: "SOUL.md",
+      title: "SOUL.md",
+      description: "Purpose, operating style, and active focus.",
+      category: "core",
+      render: ({ template, brief, contextSources }) => renderSoulMarkdown(template, brief, contextSources)
+    },
+    {
+      path: "IDENTITY.md",
+      title: "IDENTITY.md",
+      description: "Workspace identity and vibe.",
+      category: "core",
+      render: ({ template }) => renderIdentityMarkdown(template)
+    },
+    {
+      path: "USER.md",
+      title: "USER.md",
+      description: "Operator profile and durable user preferences.",
+      category: "core",
+      render: () => renderUserMarkdown()
+    },
+  ];
+
+  if (rules.compositionManaged) return specs.filter((spec) => ["AGENTS.md", "SOUL.md", "IDENTITY.md"].includes(spec.path));
+
+  if (rules.generateMemory) {
+    specs.push(
+      {
+      path: "MEMORY.md",
+      title: "MEMORY.md",
+      description: "Durable project memory.",
+      category: "memory",
+      render: ({ name, template, brief, contextSources }) =>
+        renderMemoryMarkdown(name, template, brief, contextSources)
+    },
+      {
+        path: "memory/blueprint.md",
+        title: "memory/blueprint.md",
+        description: "Project blueprint and current outcome.",
+        category: "memory",
+        render: ({ name, template, brief }) => renderBlueprintMarkdown(name, template, brief)
+      },
+      {
+        path: "memory/decisions.md",
+        title: "memory/decisions.md",
+        description: "Decision log.",
+        category: "memory",
+        render: () => renderDecisionsMarkdown()
+      }
+    );
+  }
+
+  if (rules.generateStarterDocs) {
+    specs.push(
+    {
+      path: "docs/brief.md",
+      title: "docs/brief.md",
+      description: "Objective, materialization, and declared sources.",
+      category: "docs",
+      render: ({ name, template, brief, sourceMode = "empty", contextSources }) =>
+        renderBriefMarkdown(name, template, brief, sourceMode, contextSources)
+    },
+    {
+      path: "docs/architecture.md",
+      title: "docs/architecture.md",
+      description: "Current system shape and dependencies.",
+      category: "docs",
+      render: ({ template, contextSources }) => renderArchitectureMarkdown(template, contextSources)
+    },
+      {
+        path: "deliverables/README.md",
+        title: "deliverables/README.md",
+        description: "Guidance for handoff artifacts.",
+        category: "deliverables",
+        render: () => renderDeliverablesMarkdown()
+      }
+    );
+  }
+
+  if (template === "frontend") {
+    specs.push({
+      path: "docs/ux-notes.md",
+      title: "docs/ux-notes.md",
+      description: "Interaction patterns and UI risks.",
+      category: "docs",
+      render: () => renderTemplateSpecificDoc("ux")
+    });
+  }
+
+  if (template === "backend") {
+    specs.push({
+      path: "docs/service-map.md",
+      title: "docs/service-map.md",
+      description: "Service, queue, and dependency map.",
+      category: "docs",
+      render: () => renderTemplateSpecificDoc("backend")
+    });
+  }
+
+  if (template === "research") {
+    specs.push({
+      path: "docs/research-plan.md",
+      title: "docs/research-plan.md",
+      description: "Question framing and evidence plan.",
+      category: "docs",
+      render: () => renderTemplateSpecificDoc("research")
+    });
+  }
+
+  if (template === "content") {
+    specs.push({
+      path: "docs/content-brief.md",
+      title: "docs/content-brief.md",
+      description: "Audience, channel, and campaign brief.",
+      category: "docs",
+      render: () => renderTemplateSpecificDoc("content")
+    });
+  }
+
+  return specs;
+}
+
+function inferWorkspaceDocCategory(path: string): WorkspaceDocCategory {
+  if (path.startsWith("memory/")) {
+    return "memory";
+  }
+
+  if (path.startsWith("docs/")) {
+    return "docs";
+  }
+
+  if (path.startsWith("deliverables/")) {
+    return "deliverables";
+  }
+
+  return "core";
+}
+
+function renderAgentsMarkdown({
+  name,
+  brief,
+  template,
+  sourceMode = "empty",
+  rules,
+  agents = [],
+  toolExamples = []
+}: WorkspaceScaffoldDocumentContext) {
+  return renderWorkspaceAgentsMarkdown({
+    name,
+    brief,
+    templateLabel: TEMPLATE_LABELS[template],
+    sourceMode,
+    workspaceOnly: rules.workspaceOnly,
+    workspaceSlug: slugify(name),
+    agents,
+    toolExamples
+  });
+}
+
+function slugify(value: string) {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function renderSoulMarkdown(
+  template: WorkspaceTemplate,
+  brief?: string,
+  contextSources?: WorkspaceScaffoldDocumentContext["contextSources"]
+) {
+  return `# SOUL
+
+## My Purpose
+Help this ${TEMPLATE_LABELS[template].toLowerCase()} workspace turn intent into real outcomes with pragmatic execution, verification, and durable memory.
+
+## How I Operate
+- Start from the current workspace reality before proposing large moves.
+- Prefer concrete action, visible artifacts, and clear handoffs.
+- Keep docs, memory, and deliverables aligned with the actual state of the work.
+
+## My Quirks
+- Pragmatic
+- Direct
+- Product-aware
+- Quality-minded
+
+${brief ? `## Active Focus\n${brief}\n` : ""}${renderContextSourceNotes(contextSources)}`;
+}
+
+function renderIdentityMarkdown(template: WorkspaceTemplate) {
+  return `# IDENTITY
+
+## Role
+This workspace hosts a ${TEMPLATE_LABELS[template].toLowerCase()} team coordinated through OpenClaw.
+
+**Vibe:** pragmatic, concise, quality-minded, workspace-grounded
+`;
+}
+
+function renderUserMarkdown() {
+  return `# USER
+
+## Operator Profile
+- Name:
+- What to call them:
+- Timezone:
+
+## Preferences
+- Capture stable user preferences, review style, delivery expectations, and project-specific working agreements here.
+- Keep sensitive personal details out unless the operator explicitly asks to remember them.
+`;
+}
+
+function renderMemoryMarkdown(
+  name: string,
+  template: WorkspaceTemplate,
+  brief?: string,
+  contextSources?: WorkspaceScaffoldDocumentContext["contextSources"]
+) {
+  return `# ${name} Memory
+
+Durable project facts for this ${TEMPLATE_LABELS[template].toLowerCase()} workspace.
+
+## Current brief
+${brief || "No brief captured yet. Fill this in as soon as the project goal is clarified."}
+
+## Stable facts
+- Add durable architecture, product, or workflow facts here.
+- Move longer notes into memory/*.md when they outgrow this file.
+
+${renderContextSourceNotes(contextSources)}`;
+}
+
+function renderBlueprintMarkdown(name: string, template: WorkspaceTemplate, brief?: string) {
+  return `# ${name} Blueprint
+
+## Workspace type
+${TEMPLATE_LABELS[template]}
+
+## Outcome
+${brief || "Define the target outcome, user impact, and quality bar for this workspace."}
+
+## Constraints
+- Add technical, product, legal, or operational constraints here.
+
+## Unknowns
+- Capture unresolved questions that block confident execution.
+`;
+}
+
+function renderDecisionsMarkdown() {
+  return `# Decisions
+
+Use this file for durable decisions that should survive across sessions.
+
+## Template
+- Date:
+- Decision:
+- Context:
+- Consequence:
+`;
+}
+
+function renderBriefMarkdown(
+  name: string,
+  template: WorkspaceTemplate,
+  brief: string | undefined,
+  sourceMode: WorkspaceSourceMode,
+  contextSources?: WorkspaceScaffoldDocumentContext["contextSources"]
+) {
+  return `# ${name} Brief
+
+## Template
+${TEMPLATE_LABELS[template]}
+
+## Materialization
+${sourceMode}
+
+## Objective
+${brief || "Clarify the main goal, target user, and success definition for this workspace."}
+
+## Success signals
+- Define what success looks like in observable terms.
+
+## Open questions
+- List the unknowns worth resolving first.
+
+${renderContextSourceNotes(contextSources)}`;
+}
+
+function renderArchitectureMarkdown(
+  template: WorkspaceTemplate,
+  contextSources?: WorkspaceScaffoldDocumentContext["contextSources"]
+) {
+  return `# Architecture
+
+## Current shape
+- Describe the main components, systems, or content lanes in this ${TEMPLATE_LABELS[template].toLowerCase()} workspace.
+
+## Dependencies
+- List critical external services, repos, data sources, or channels.
+
+## Risks
+- Capture structural, operational, or delivery risks here.
+
+${renderContextSourceNotes(contextSources)}`;
+}
+
+function renderDeliverablesMarkdown() {
+  return `# Deliverables
+
+Use this folder for substantial output artifacts that should be easy to hand off or review.
+
+- Create one subfolder per task or run, for example \`deliverables/2026-03-07-15-30-00-launch-brief/\`.
+- Put drafts, reports, docs, and publishable assets for that task inside its run folder.
+- Keep filenames descriptive and tied to the task or audience.
+`;
+}
+
+function renderTemplateSpecificDoc(kind: "ux" | "backend" | "research" | "content") {
+  if (kind === "ux") {
+    return `# UX Notes
+
+- Track interaction patterns, responsive edge cases, and visual risk areas here.
+`;
+  }
+
+  if (kind === "backend") {
+    return `# Service Map
+
+- Document services, jobs, queues, external dependencies, and critical flows here.
+`;
+  }
+
+  if (kind === "research") {
+    return `# Research Plan
+
+- State the question, method, evidence sources, and expected output before large investigation work.
+`;
+  }
+
+  return `# Content Brief
+
+- Capture audience, channel, tone, CTA, and distribution assumptions for this content workspace.
+`;
+}
+
+function renderContextSourceNotes(contextSources?: WorkspaceScaffoldDocumentContext["contextSources"]) {
+  const readySources = (contextSources ?? [])
+    .filter((source) => source.status !== "error" && source.summary.trim().length > 0)
+    .slice(0, 4);
+
+  if (readySources.length === 0) {
+    return "";
+  }
+
+  const evidenceSources = readySources.filter((source) => (source.confidence ?? 100) >= 80);
+  const assumptionSources = readySources.filter((source) => (source.confidence ?? 100) < 80);
+
+  const formatLine = (source: (typeof readySources)[number]) => {
+    const kindLabel =
+      source.kind === "website"
+        ? "Website"
+        : source.kind === "repo"
+          ? "Repository"
+          : source.kind === "folder"
+            ? "Folder"
+            : "Prompt";
+    const confidenceLabel = typeof source.confidence === "number" ? ` (${source.confidence}%)` : "";
+
+    return `- ${kindLabel}: ${source.label}${confidenceLabel} - ${source.summary}`;
+  };
+
+  const sections: string[] = [];
+
+  if (evidenceSources.length > 0) {
+    sections.push(`## Declared sources\n${evidenceSources.map(formatLine).join("\n")}`);
+  }
+
+  if (assumptionSources.length > 0) {
+    sections.push(`## Declared sources needing confirmation\n${assumptionSources.map(formatLine).join("\n")}`);
+  }
+
+  return sections.length > 0 ? `\n${sections.join("\n\n")}\n` : "";
+}
+
+function knowledgeSourceToLegacyContextSource(source: WorkspaceKnowledgeSource): Pick<PlannerContextSource, "kind" | "label" | "summary" | "confidence" | "url" | "status"> {
+  const url = source.locator.kind === "website"
+    ? source.locator.url
+    : source.locator.kind === "repository"
+      ? source.locator.remoteUrl ?? source.locator.localPath
+      : source.locator.kind === "file" || source.locator.kind === "folder"
+        ? source.locator.path
+        : undefined;
+  return {
+    kind: source.kind === "repository" ? "repo" : source.kind === "connector" || source.kind === "file" ? "prompt" : source.kind,
+    label: source.label,
+    summary: source.summary,
+    ...(source.confidence !== undefined ? { confidence: source.confidence } : {}),
+    ...(url ? { url } : {}),
+    status: source.status
+  };
+}

@@ -1,0 +1,80 @@
+{
+  "certification": "official-gateway-transport",
+  "target": {
+    "version": "2026.9.4",
+    "sourceCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+    "protocol": 4,
+    "gatewayUrl": "ws://127.0.0.1:50751/"
+  },
+  "identity": {
+    "clientName": "gateway-client",
+    "mode": "backend",
+    "hasDeviceIdentity": false
+  },
+  "handshake": {
+    "serverVersion": "2026.9.4",
+    "connectionId": "3e6ea2f7-a4b3-4601-95fc-764133d4f319",
+    "grantedRole": "operator",
+    "grantedScopes": [
+      "operator.admin",
+      "operator.read",
+      "operator.write",
+      "operator.approvals",
+      "operator.questions",
+      "operator.pairing",
+      "operator.talk",
+      "operator.talk.secrets"
+    ]
+  },
+  "requests": {
+    "health": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "status": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "models.list": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "agents.list": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "sessions.list": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "tasks.list": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "channels.status": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    },
+    "config.get": {
+      "status": "passed",
+      "kind": null,
+      "message": null
+    }
+  },
+  "authorizationDenial": {
+    "status": "denied",
+    "kind": "scope-limited",
+    "message": "missing scope: operator.admin"
+  },
+  "eventCount": 6,
+  "sequenceGaps": [],
+  "startedAt": "2026-09-14T21:04:20.073Z",
+  "completedAt": "2026-09-14T21:04:20.330Z"
+}

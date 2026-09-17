@@ -1,0 +1,78 @@
+FROM node:24.20.0-bookworm@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2 AS agentos-build
+
+ENV PNPM_HOME=/pnpm
+ENV PATH=/pnpm:$PATH
+
+RUN corepack enable
+
+WORKDIR /build
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+RUN mkdir -p /runtime-extras/node_modules && \
+    cp -LR node_modules/ws /runtime-extras/node_modules/ws
+
+COPY . .
+RUN pnpm build
+
+FROM ghcr.io/openclaw/openclaw:2026.9.4@sha256:cc596b846506a5f4cfcee111394a2725f375f01cca2ebb492a161fd1b747f101
+
+USER root
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      chromium \
+      chromium-sandbox \
+      git \
+      gosu \
+      novnc \
+      openbox \
+      x11vnc \
+      xvfb && \
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+
+WORKDIR /agentos
+
+COPY --from=agentos-build --chown=node:node /build/.next/standalone ./
+COPY --from=agentos-build --chown=node:node /build/.next/static ./.next/static
+COPY --from=agentos-build --chown=node:node /build/public ./public
+COPY --from=agentos-build --chown=node:node /runtime-extras/node_modules/ws ./node_modules/ws
+COPY --chown=node:node scripts/railway-supervisor.mjs ./scripts/railway-supervisor.mjs
+COPY --chown=node:node scripts/railway-public-proxy.mjs ./scripts/railway-public-proxy.mjs
+COPY --chown=node:node scripts/secure-browser-worker.mjs ./scripts/secure-browser-worker.mjs
+COPY --chown=node:node scripts/secure-browser-integration-smoke.mjs ./scripts/secure-browser-integration-smoke.mjs
+COPY --chown=node:node scripts/railway-openclaw-bootstrap.mjs ./scripts/railway-openclaw-bootstrap.mjs
+COPY --chown=node:node openclaw-plugins/agentos-browser-policy ./openclaw-plugins/agentos-browser-policy
+COPY scripts/railway-entrypoint.sh ./scripts/railway-entrypoint.sh
+COPY scripts/railway-browser-worker-entrypoint.sh ./scripts/railway-browser-worker-entrypoint.sh
+
+RUN chmod 0755 ./scripts/railway-entrypoint.sh ./scripts/railway-browser-worker-entrypoint.sh && \
+    rm -rf /home/node/.openclaw /home/node/.config/openclaw && \
+    mkdir -p /home/node/.config /home/node/Documents/Shared && \
+    ln -s /data/agentos/mission-control /agentos/.mission-control && \
+    ln -s /data/openclaw /home/node/.openclaw && \
+    ln -s /data/openclaw-config /home/node/.config/openclaw && \
+    ln -s /data/workspaces /home/node/Documents/Shared/projects && \
+    cp -a /usr/share/novnc /agentos/public/novnc && \
+    chown -R node:node /agentos/public/novnc && \
+    chown -h node:node \
+      /agentos/.mission-control \
+      /home/node/.openclaw \
+      /home/node/.config/openclaw \
+      /home/node/Documents/Shared/projects
+
+ENV NODE_ENV=production \
+    HOSTNAME=0.0.0.0 \
+    HOME=/home/node \
+    AGENTOS_PACKAGE_RUNTIME=1 \
+    AGENTOS_DEPLOYMENT_PLATFORM=railway \
+    AGENTOS_RUNTIME_DIR=/data/agentos \
+    AGENTOS_SUPERVISOR_SOCKET_PATH=/tmp/agentos-supervisor.sock \
+    AGENTOS_BROWSER_PROFILE_ROOT=/data/browser-profiles \
+    AGENTOS_BROWSER_WORKER_SOCKET_PATH=/tmp/agentos-browser-worker.sock \
+    OPENCLAW_STATE_DIR=/data/openclaw \
+    OPENCLAW_CONFIG_PATH=/data/openclaw/openclaw.json \
+    OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789 \
+    CHROME_BIN=/usr/bin/chromium
+
+ENTRYPOINT ["tini", "-s", "--", "/agentos/scripts/railway-entrypoint.sh"]

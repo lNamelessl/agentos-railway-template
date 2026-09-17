@@ -1,0 +1,236 @@
+import assert from "node:assert/strict";
+import { afterEach, test } from "node:test";
+
+import { resetOpenClawEventBridgeForTesting } from "@/lib/openclaw/application/event-bridge-service";
+import { clearMissionControlCaches } from "@/lib/openclaw/application/mission-control-service";
+import { resetOpenClawGatewayClient } from "@/lib/openclaw/client/gateway-client-factory";
+import {
+  createManagedChatChannelAccount as createApplicationManagedChatChannelAccount,
+  createManagedSurfaceAccount as createApplicationManagedSurfaceAccount,
+  deleteWorkspaceChannelEverywhere as deleteApplicationWorkspaceChannelEverywhere,
+  disconnectWorkspaceChannel as disconnectApplicationWorkspaceChannel,
+  upsertWorkspaceChannel as upsertApplicationWorkspaceChannel
+} from "@/lib/openclaw/application/channel-service";
+import {
+  createManagedChatChannelAccount as createCompatibilityManagedChatChannelAccount,
+  createManagedSurfaceAccount as createCompatibilityManagedSurfaceAccount,
+  deleteWorkspaceChannelEverywhere as deleteCompatibilityWorkspaceChannelEverywhere,
+  disconnectWorkspaceChannel as disconnectCompatibilityWorkspaceChannel,
+  upsertWorkspaceChannel as upsertCompatibilityWorkspaceChannel
+} from "@/lib/openclaw/service";
+
+async function readErrorMessage(action: () => Promise<unknown>) {
+  try {
+    await action();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  throw new Error("Expected action to throw.");
+}
+
+afterEach(() => {
+  resetOpenClawEventBridgeForTesting();
+  resetOpenClawGatewayClient("channel service compatibility test cleanup");
+  clearMissionControlCaches();
+});
+
+test("channel application service preserves upsert validation shape", async () => {
+  const input = {
+    workspaceId: "workspace:test",
+    workspacePath: "/tmp/workspace-test",
+    channelId: " ",
+    type: "telegram",
+    name: "Test"
+  };
+
+  assert.equal(
+    await readErrorMessage(() => upsertApplicationWorkspaceChannel(input)),
+    await readErrorMessage(() => upsertCompatibilityWorkspaceChannel(input))
+  );
+});
+
+test("channel application service preserves disconnect validation shape", async () => {
+  const input = {
+    workspaceId: "workspace:test",
+    channelId: " "
+  };
+
+  assert.equal(
+    await readErrorMessage(() => disconnectApplicationWorkspaceChannel(input)),
+    await readErrorMessage(() => disconnectCompatibilityWorkspaceChannel(input))
+  );
+});
+
+test("channel application service preserves delete missing-channel shape", async () => {
+  const input = {
+    channelId: "missing-channel-characterization"
+  };
+
+  assert.equal(
+    await readErrorMessage(() => deleteApplicationWorkspaceChannelEverywhere(input)),
+    await readErrorMessage(() => deleteCompatibilityWorkspaceChannelEverywhere(input))
+  );
+});
+
+test("channel application service preserves Telegram provisioning validation shape", async () => {
+  const input = {
+    provider: "telegram",
+    name: "Telegram",
+    token: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves managed Telegram chat validation shape", async () => {
+  const input = {
+    provider: "telegram",
+    name: "Telegram",
+    token: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedChatChannelAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedChatChannelAccount(input))
+  );
+});
+
+test("channel application service preserves Discord provisioning validation shape", async () => {
+  const input = {
+    provider: "discord",
+    name: "Discord",
+    token: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves managed Discord chat validation shape", async () => {
+  const input = {
+    provider: "discord",
+    name: "Discord",
+    token: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedChatChannelAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedChatChannelAccount(input))
+  );
+});
+
+test("channel application service preserves Slack provisioning validation shape", async () => {
+  const input = {
+    provider: "slack",
+    name: "Slack",
+    botToken: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves managed Slack chat validation shape", async () => {
+  const input = {
+    provider: "slack",
+    name: "Slack",
+    botToken: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedChatChannelAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedChatChannelAccount(input))
+  );
+});
+
+test("channel application service preserves Google Chat provisioning validation shape", async () => {
+  const input = {
+    provider: "googlechat",
+    name: "Google Chat",
+    webhookUrl: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves managed Google Chat validation shape", async () => {
+  const input = {
+    provider: "googlechat",
+    name: "Google Chat",
+    webhookUrl: " "
+  } as const;
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedChatChannelAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedChatChannelAccount(input))
+  );
+});
+
+test("channel application service preserves Gmail provisioning validation shape", async () => {
+  const input = {
+    provider: "gmail",
+    name: "Gmail",
+    config: {}
+  };
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves webhook provisioning validation shape", async () => {
+  const input = {
+    provider: "webhook",
+    name: "Webhook",
+    config: {
+      token: " "
+    }
+  };
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves cron provisioning validation shape", async () => {
+  const input = {
+    provider: "cron",
+    name: "Cron",
+    config: {
+      webhookToken: " "
+    }
+  };
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});
+
+test("channel application service preserves email provisioning validation shape", async () => {
+  const input = {
+    provider: "email",
+    name: "Email",
+    config: {
+      address: " "
+    }
+  };
+
+  assert.equal(
+    await readErrorMessage(() => createApplicationManagedSurfaceAccount(input)),
+    await readErrorMessage(() => createCompatibilityManagedSurfaceAccount(input))
+  );
+});

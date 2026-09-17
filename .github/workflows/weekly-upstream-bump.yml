@@ -1,0 +1,75 @@
+name: Weekly upstream bump
+
+# Checks SapienXai/AgentOS for a new commit on the default branch. On a new commit it
+# replaces the vendored tree, updates UPSTREAM_PIN, runs a Dockerfile.railway build smoke
+# test, and opens a bump PR only if the smoke test passes.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out template repo
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream HEAD
+        id: upstream
+        run: |
+          sha="$(git ls-remote https://github.com/SapienXai/AgentOS HEAD | cut -f1)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          pinned="$(sed -n 's/^commit: //p' UPSTREAM_PIN)"
+          echo "pinned=${pinned}" >> "$GITHUB_OUTPUT"
+          if [ "${sha}" = "${pinned}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream is unchanged (${sha})."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream moved: ${pinned} -> ${sha}"
+          fi
+
+      - name: Replace vendored tree with upstream commit
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Keep template-owned paths; everything else is upstream content.
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' ! -name '.github' ! -name 'UPSTREAM_PIN' \
+            -exec rm -rf {} +
+          curl -fsSL "https://github.com/SapienXai/AgentOS/archive/${{ steps.upstream.outputs.sha }}.tar.gz" \
+            | tar -xz --strip-components=1 -C .
+          # Restore template-owned files on top.
+          cp .github/template/README.md README.md
+          sed -i "s/^commit: .*/commit: ${{ steps.upstream.outputs.sha }}/" UPSTREAM_PIN
+          today="$(date -u +%F)"
+          sed -i "s/^pinned: .*/pinned: ${today}/" UPSTREAM_PIN
+
+      - name: Smoke test — docker build (Dockerfile.railway)
+        if: steps.upstream.outputs.changed == 'true'
+        run: docker build -f Dockerfile.railway -t agentos-railway:bump-smoke .
+
+      - name: Create bump pull request
+        if: steps.upstream.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: upstream-bump
+          title: "Bump vendored AgentOS to ${{ steps.upstream.outputs.sha }}"
+          body: |
+            Automated weekly upstream bump.
+
+            - Upstream: SapienXai/AgentOS@${{ steps.upstream.outputs.sha }}
+            - Previous pin: ${{ steps.upstream.outputs.pinned }}
+            - Smoke test: `docker build -f Dockerfile.railway .` passed on this commit.
+
+            Review upstream release notes before merging, and redeploy the Railway
+            template service after merging to pick up the new revision.
+          commit-message: "Bump vendored AgentOS to ${{ steps.upstream.outputs.sha }}"
+          delete-branch: true

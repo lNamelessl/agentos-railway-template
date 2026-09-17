@@ -1,0 +1,929 @@
+import "server-only";
+
+import type { Dirent } from "node:fs";
+import { lstat, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+import { getMissionControlSnapshot } from "@/lib/openclaw/application/mission-control-service";
+import { ensureAgentPolicySkill } from "@/lib/openclaw/domains/agent-provisioning";
+import {
+  readWorkspaceProjectManifest,
+  updateWorkspaceProjectManifestAgentProfile,
+  type WorkspaceProjectManifestAgent
+} from "@/lib/openclaw/domains/workspace-manifest";
+import { workspacePathMatchesId } from "@/lib/openclaw/domains/workspace-id";
+import { OPENCLAW_LEGACY_WORKSPACE_FILES } from "@/lib/openclaw/workspace-bootstrap-files";
+import type {
+  WorkspaceManagedFile,
+  WorkspaceManagedFileCategory,
+  WorkspaceManagedFileLanguage,
+  WorkspaceManagedFileListResponse,
+  WorkspaceManagedFileReadResponse,
+  WorkspaceManagedFileSource
+} from "@/lib/openclaw/workspace-file-types";
+import type { WorkspaceProject } from "@/lib/openclaw/types";
+
+export const WORKSPACE_MANAGED_FILE_MAX_BYTES = 512 * 1024;
+
+type WorkspaceFileSpec = {
+  path: string;
+  category: WorkspaceManagedFileCategory;
+  language: WorkspaceManagedFileLanguage;
+  description: string;
+  usage?: string;
+  runtimeBehavior?: string;
+  createable?: boolean;
+};
+
+type WorkspaceFileDescriptor = {
+  category: WorkspaceManagedFileCategory;
+  language: WorkspaceManagedFileLanguage;
+  source: WorkspaceManagedFileSource;
+  description?: string;
+  usage?: string;
+  runtimeBehavior?: string;
+  createable: boolean;
+};
+
+const officialWorkspaceFileSpecs: WorkspaceFileSpec[] = [
+  {
+    path: "AGENTS.md",
+    category: "context",
+    language: "markdown",
+    description: "Shared workspace context, team roster, tool notes, and operating rules.",
+    usage: "Keep workspace-wide instructions here. Agent-specific behavior belongs in the AgentOS worker profile and assigned policy skill.",
+    runtimeBehavior: "OpenClaw loads AGENTS.md from the workspace root as bootstrap context for every agent turn."
+  },
+  {
+    path: "SOUL.md",
+    category: "context",
+    language: "markdown",
+    description: "Workspace-level purpose, operating style, and active focus.",
+    usage: "Use this for the project/workspace mission and shared working philosophy. Keep agent-specific behavior in the agent profile and policy skill.",
+    runtimeBehavior: "OpenClaw loads SOUL.md from the workspace root as shared context for all agents."
+  },
+  {
+    path: "USER.md",
+    category: "context",
+    language: "markdown",
+    description: "Operator preferences and user profile context.",
+    usage: "Capture stable user preferences such as language, tone, review style, or delivery expectations.",
+    runtimeBehavior: "OpenClaw loads USER.md from the workspace root when it exists."
+  },
+  {
+    path: "IDENTITY.md",
+    category: "identity",
+    language: "markdown",
+    description: "Workspace-wide identity and display profile.",
+    usage: "Use this for the identity of the workspace as a whole, not for a single agent's personality.",
+    runtimeBehavior: "OpenClaw loads IDENTITY.md from the workspace root as shared identity context."
+  },
+  {
+    path: "BOOT.md",
+    category: "boot",
+    language: "markdown",
+    description: "Startup checklist for workspace boot flows.",
+    usage: "Use this for instructions that should run or be reviewed during workspace startup.",
+    runtimeBehavior: "OpenClaw supports boot-oriented markdown hooks when configured."
+  },
+  {
+    path: "BOOTSTRAP.md",
+    category: "boot",
+    language: "markdown",
+    description: "One-time first-run bootstrap ritual.",
+    usage: "Use this for initial setup or first-run orientation instructions.",
+    runtimeBehavior: "OpenClaw may create BOOTSTRAP.md for a brand-new workspace. It is a one-time first-run file and is not recreated after it is removed.",
+    createable: false
+  },
+  {
+    path: "MEMORY.md",
+    category: "memory",
+    language: "markdown",
+    description: "Curated long-term workspace memory.",
+    usage: "Store durable project facts, decisions, constraints, and stable context that should survive across sessions.",
+    runtimeBehavior: "OpenClaw loads MEMORY.md from the workspace root as shared memory context."
+  },
+  {
+    path: ".openclaw/project.json",
+    category: "project-config",
+    language: "json",
+    description: "AgentOS/OpenClaw workspace project metadata.",
+    usage: "Stores workspace metadata, agent roster/config, template, rules, and related AgentOS state. Edit carefully.",
+    runtimeBehavior: "AgentOS uses this file to keep workspace and agent metadata in sync. JSON must be valid before saving."
+  },
+  {
+    path: ".openclaw/workspace-state.json",
+    category: "project-config",
+    language: "json",
+    description: "OpenClaw workspace bootstrap state.",
+    usage: "Read-only bootstrap state generated by OpenClaw/AgentOS.",
+    runtimeBehavior: "AgentOS lists this safely when present but does not allow creation from the modal.",
+    createable: false
+  }
+];
+
+const officialSpecByPath = new Map(officialWorkspaceFileSpecs.map((spec) => [spec.path, spec]));
+const legacyWorkspaceFileSpecs: Map<string, WorkspaceFileSpec> = new Map(
+  OPENCLAW_LEGACY_WORKSPACE_FILES.map((legacy) => [
+    legacy.path,
+    {
+      path: legacy.path,
+      category: legacy.path === "TOOLS.md" ? "tools" : "boot",
+      language: "markdown",
+      description: `${legacy.path} is a preserved legacy OpenClaw workspace file.`,
+      usage: `Preserve or edit this file only for compatibility. Move current guidance to ${legacy.replacement}.`,
+      runtimeBehavior: `${legacy.runtime} Run the supported OpenClaw Doctor migration when available.`,
+      createable: false
+    } satisfies WorkspaceFileSpec
+  ])
+);
+const blockedPathTokenPattern = /(^|[-_.])(auth|credential|credentials|secret|secrets|token|tokens|key|keys|session|sessions|provider|providers|env|oauth|cookie|cookies)([-_.]|$)/i;
+const safeOpenClawRootFileNames = new Set([
+  "project.json",
+  "workspace-state.json",
+  "workspace.json",
+  "workspace.md",
+  "project.md",
+  "metadata.json",
+  "metadata.md",
+  "README.md"
+]);
+export async function listWorkspaceManagedFiles(workspaceId: string): Promise<WorkspaceManagedFileListResponse> {
+  const workspace = await resolveWorkspace(workspaceId);
+  const files = await listWorkspaceManagedFilesForPath(workspace.path);
+
+  return {
+    workspaceId: workspace.id,
+    workspacePath: workspace.path,
+    files,
+    maxFileBytes: WORKSPACE_MANAGED_FILE_MAX_BYTES
+  };
+}
+
+export async function readWorkspaceManagedFile(input: {
+  workspaceId: string;
+  path: string;
+}): Promise<WorkspaceManagedFileReadResponse> {
+  const workspace = await resolveWorkspace(input.workspaceId);
+  const result = await readWorkspaceManagedFileForPath(workspace.path, input.path);
+
+  return {
+    workspaceId: workspace.id,
+    workspacePath: workspace.path,
+    ...result
+  };
+}
+
+export async function readWorkspaceManagedFileForPath(
+  workspacePath: string,
+  inputPath: string
+): Promise<Omit<WorkspaceManagedFileReadResponse, "workspaceId" | "workspacePath">> {
+  const normalizedInputPath = normalizeWorkspaceRelativePath(inputPath);
+  const agentProfileId = parseAgentProfileVirtualPath(normalizedInputPath);
+  if (agentProfileId) {
+    return readWorkspaceAgentProfileFileForPath(workspacePath, agentProfileId);
+  }
+
+  const { file, absolutePath } = await resolveWorkspaceManagedFileForPath(workspacePath, inputPath);
+
+  if (!file.exists) {
+    if (!file.createable) {
+      throw new Error("Workspace file does not exist.");
+    }
+
+    return {
+      file,
+      content: "",
+      maxFileBytes: WORKSPACE_MANAGED_FILE_MAX_BYTES
+    };
+  }
+
+  if (!file.editable) {
+    throw new Error(file.reason ?? "Workspace file is not editable.");
+  }
+
+  const content = await readFile(absolutePath, "utf8");
+
+  return {
+    file,
+    content,
+    maxFileBytes: WORKSPACE_MANAGED_FILE_MAX_BYTES
+  };
+}
+
+export async function writeWorkspaceManagedFile(input: {
+  workspaceId: string;
+  path: string;
+  content: string;
+}): Promise<WorkspaceManagedFileReadResponse> {
+  const workspace = await resolveWorkspace(input.workspaceId);
+  const result = await writeWorkspaceManagedFileForPath(workspace.path, input.path, input.content);
+
+  return {
+    workspaceId: workspace.id,
+    workspacePath: workspace.path,
+    ...result
+  };
+}
+
+export async function writeWorkspaceManagedFileForPath(
+  workspacePath: string,
+  inputPath: string,
+  content: string
+): Promise<Omit<WorkspaceManagedFileReadResponse, "workspaceId" | "workspacePath">> {
+  const normalizedInputPath = normalizeWorkspaceRelativePath(inputPath);
+  const agentProfileId = parseAgentProfileVirtualPath(normalizedInputPath);
+  if (agentProfileId) {
+    return writeWorkspaceAgentProfileFileForPath(workspacePath, agentProfileId, content);
+  }
+
+  const { file, absolutePath, workspaceRealPath } = await resolveWorkspaceManagedFileForPath(
+    workspacePath,
+    inputPath
+  );
+
+  if (!file.exists && !file.createable) {
+    throw new Error("Workspace file cannot be created from this surface.");
+  }
+
+  if (Buffer.byteLength(content, "utf8") > WORKSPACE_MANAGED_FILE_MAX_BYTES) {
+    throw new Error(`Workspace file exceeds ${formatBytes(WORKSPACE_MANAGED_FILE_MAX_BYTES)}.`);
+  }
+
+  if (file.language === "json") {
+    try {
+      JSON.parse(content);
+    } catch (error) {
+      throw new Error(error instanceof Error ? `Invalid JSON: ${error.message}` : "Invalid JSON.");
+    }
+  }
+
+  const parentPath = path.dirname(absolutePath);
+  await ensureWorkspaceDirectory(parentPath, workspacePath, workspaceRealPath);
+
+  if (file.exists) {
+    await assertExistingFileSafe(absolutePath, workspaceRealPath);
+  }
+
+  await writeFile(absolutePath, content, "utf8");
+
+  return readWorkspaceManagedFileForPath(workspacePath, file.path);
+}
+
+export async function listWorkspaceManagedFilesForPath(workspacePath: string) {
+  const workspaceRealPath = await realpath(workspacePath);
+  const fileMap = new Map<string, WorkspaceManagedFile>();
+
+  for (const spec of officialWorkspaceFileSpecs) {
+    fileMap.set(spec.path, await buildFileEntry(workspacePath, workspaceRealPath, spec.path, {
+      category: spec.category,
+      language: spec.language,
+      source: "official",
+      description: spec.description,
+      usage: spec.usage,
+      runtimeBehavior: spec.runtimeBehavior,
+      createable: spec.createable !== false
+    }));
+  }
+
+  for (const [relativePath, spec] of legacyWorkspaceFileSpecs) {
+    const file = await buildFileEntry(workspacePath, workspaceRealPath, relativePath, {
+      category: spec.category,
+      language: spec.language,
+      source: "discovered",
+      description: spec.description,
+      usage: spec.usage,
+      runtimeBehavior: spec.runtimeBehavior,
+      createable: false
+    });
+
+    if (file.exists) {
+      fileMap.set(relativePath, file);
+    }
+  }
+
+  for (const relativePath of await discoverSafeWorkspaceFilePaths(workspacePath)) {
+    if (fileMap.has(relativePath)) {
+      continue;
+    }
+
+    const descriptor = describeAllowedWorkspaceFile(relativePath, "discovered");
+    if (!descriptor) {
+      continue;
+    }
+
+    fileMap.set(relativePath, await buildFileEntry(workspacePath, workspaceRealPath, relativePath, descriptor));
+  }
+
+  for (const file of await listAgentProfileVirtualFiles(workspacePath)) {
+    fileMap.set(file.path, file);
+  }
+
+  return Array.from(fileMap.values()).sort(compareWorkspaceManagedFiles);
+}
+
+export async function resolveWorkspaceManagedFileForPath(workspacePath: string, inputPath: string) {
+  const normalizedPath = normalizeWorkspaceRelativePath(inputPath);
+  const agentProfileId = parseAgentProfileVirtualPath(normalizedPath);
+  if (agentProfileId) {
+    const file = await resolveAgentProfileVirtualFile(workspacePath, agentProfileId);
+
+    return {
+      file,
+      absolutePath: path.join(workspacePath, "AGENTS.md"),
+      workspaceRealPath: await realpath(workspacePath)
+    };
+  }
+
+  const descriptor = describeAllowedWorkspaceFile(normalizedPath, officialSpecByPath.has(normalizedPath) ? "official" : "discovered");
+
+  if (!descriptor) {
+    throw new Error("Workspace file is not in the editable OpenClaw workspace allowlist.");
+  }
+
+  const workspaceRealPath = await realpath(workspacePath);
+  const absolutePath = resolveWorkspaceChildPath(workspacePath, normalizedPath);
+  const file = await buildFileEntry(workspacePath, workspaceRealPath, normalizedPath, descriptor);
+
+  return {
+    file,
+    absolutePath,
+    workspaceRealPath
+  };
+}
+
+async function resolveWorkspace(workspaceId: string) {
+  const normalizedWorkspaceId = workspaceId.trim();
+
+  if (!normalizedWorkspaceId) {
+    throw new Error("Workspace id is required.");
+  }
+
+  const snapshot = await getMissionControlSnapshot({ includeHidden: true });
+  const workspace = findWorkspaceById(snapshot.workspaces, normalizedWorkspaceId);
+
+  if (!workspace) {
+    throw new Error("Workspace was not found.");
+  }
+
+  return workspace;
+}
+
+function findWorkspaceById(workspaces: WorkspaceProject[], workspaceId: string) {
+  return (
+    workspaces.find((workspace) => workspace.id === workspaceId) ??
+    workspaces.find((workspace) => workspacePathMatchesId(workspace.path, workspaceId))
+  );
+}
+
+async function discoverSafeWorkspaceFilePaths(workspacePath: string) {
+  const discovered = new Set<string>();
+
+  await collectFiles(workspacePath, "memory", discovered, {
+    maxDepth: 4,
+    include: (relativePath) => relativePath.endsWith(".md")
+  });
+  await collectFiles(workspacePath, "docs", discovered, {
+    maxDepth: 4,
+    include: (relativePath) => relativePath.endsWith(".md") || relativePath.endsWith(".json")
+  });
+  await collectFiles(workspacePath, "skills", discovered, {
+    maxDepth: 4,
+    include: (relativePath) => relativePath.endsWith("/SKILL.md")
+  });
+  await collectFiles(workspacePath, ".agents/skills", discovered, {
+    maxDepth: 4,
+    include: (relativePath) => relativePath.endsWith("/SKILL.md")
+  });
+  await collectFiles(workspacePath, ".openclaw", discovered, {
+    maxDepth: 4,
+    include: (relativePath) => Boolean(describeAllowedOpenClawRelativePath(relativePath))
+  });
+
+  return Array.from(discovered);
+}
+
+async function listAgentProfileVirtualFiles(workspacePath: string) {
+  const manifest = await readWorkspaceProjectManifest(workspacePath);
+
+  return manifest.agents
+    .filter((agent) => agent.enabled && isSafeVirtualAgentId(agent.id))
+    .map((agent) => buildAgentProfileVirtualFile(agent));
+}
+
+async function readWorkspaceAgentProfileFileForPath(
+  workspacePath: string,
+  agentId: string
+): Promise<Omit<WorkspaceManagedFileReadResponse, "workspaceId" | "workspacePath">> {
+  const file = await resolveAgentProfileVirtualFile(workspacePath, agentId);
+  const manifest = await readWorkspaceProjectManifest(workspacePath);
+  const content =
+    manifest.agents.find((agent) => agent.id === agentId)?.workerProfile?.employment.behaviorInstructions ??
+    "#### Persona\n\n#### Responsibilities\n\n#### Operating Notes\n\n#### Boundaries";
+
+  return {
+    file: {
+      ...file,
+      size: Buffer.byteLength(content, "utf8")
+    },
+    content,
+    maxFileBytes: WORKSPACE_MANAGED_FILE_MAX_BYTES
+  };
+}
+
+async function writeWorkspaceAgentProfileFileForPath(
+  workspacePath: string,
+  agentId: string,
+  content: string
+): Promise<Omit<WorkspaceManagedFileReadResponse, "workspaceId" | "workspacePath">> {
+  await resolveAgentProfileVirtualFile(workspacePath, agentId);
+
+  if (Buffer.byteLength(content, "utf8") > WORKSPACE_MANAGED_FILE_MAX_BYTES) {
+    throw new Error(`Workspace file exceeds ${formatBytes(WORKSPACE_MANAGED_FILE_MAX_BYTES)}.`);
+  }
+
+  if (/^#{1,3}\s+/m.test(content)) {
+    throw new Error("Agent Profile content must use level-4 headings or plain text inside the agent section.");
+  }
+
+  const manifest = await updateWorkspaceProjectManifestAgentProfile(workspacePath, agentId, content);
+  const snapshot = await getMissionControlSnapshot({ force: true, includeHidden: true });
+  const runtimeAgent = snapshot.agents.find(
+    (entry) => entry.id === agentId && entry.workspacePath === workspacePath
+  );
+
+  if (runtimeAgent) {
+    const setupAgentId =
+      snapshot.agents.find(
+        (entry) => entry.workspaceId === runtimeAgent.workspaceId && entry.policy.preset === "setup" && entry.id !== agentId
+      )?.id ?? null;
+
+    await ensureAgentPolicySkill({
+      workspacePath,
+      agentId,
+      agentName: runtimeAgent.name,
+      policy: runtimeAgent.policy,
+      behaviorInstructions:
+        manifest.agents.find((entry) => entry.id === agentId)?.workerProfile?.employment.behaviorInstructions,
+      setupAgentId,
+      snapshot
+    });
+  }
+
+  return readWorkspaceAgentProfileFileForPath(workspacePath, agentId);
+}
+
+async function resolveAgentProfileVirtualFile(workspacePath: string, agentId: string) {
+  if (!isSafeVirtualAgentId(agentId)) {
+    throw new Error("Workspace file is not in the editable OpenClaw workspace allowlist.");
+  }
+
+  const manifest = await readWorkspaceProjectManifest(workspacePath);
+  const agent = manifest.agents.find((entry) => entry.id === agentId && entry.enabled);
+
+  if (!agent) {
+    throw new Error("Agent Profile is not available for this workspace agent.");
+  }
+
+  return buildAgentProfileVirtualFile(agent);
+}
+
+function buildAgentProfileVirtualFile(agent: WorkspaceProjectManifestAgent): WorkspaceManagedFile {
+  return {
+    path: buildAgentProfileVirtualPath(agent.id),
+    label: "Agent Profile",
+    category: "identity",
+    language: "markdown",
+    exists: true,
+    createable: false,
+    editable: true,
+    size: null,
+    source: "virtual",
+    description: `${agent.name ?? agent.id} persona, responsibilities, boundaries, and operating notes.`,
+    usage: "Write agent-specific character, voice, duties, boundaries, and handoff notes here. Use level-4 headings such as #### Persona.",
+    runtimeBehavior: "This AgentOS virtual file is stored in the worker profile sidecar and compiled into the assigned agent policy skill; it is not shared workspace context."
+  };
+}
+
+function buildAgentProfileVirtualPath(agentId: string) {
+  return `agents/${agentId}/PROFILE.md`;
+}
+
+function parseAgentProfileVirtualPath(relativePath: string) {
+  const match = /^agents\/([^/]+)\/PROFILE\.md$/.exec(relativePath);
+  const agentId = match?.[1];
+
+  return agentId && isSafeVirtualAgentId(agentId) ? agentId : null;
+}
+
+function isSafeVirtualAgentId(agentId: string) {
+  return /^[A-Za-z0-9_.-]+$/.test(agentId);
+}
+
+function isNotFoundError(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+async function collectFiles(
+  workspacePath: string,
+  relativeDirectory: string,
+  output: Set<string>,
+  options: {
+    maxDepth: number;
+    include: (relativePath: string) => boolean;
+  },
+  currentDepth = 0
+) {
+  if (currentDepth > options.maxDepth || output.size > 500) {
+    return;
+  }
+
+  const absoluteDirectory = resolveWorkspaceChildPath(workspacePath, relativeDirectory);
+
+  let entries: Dirent<string>[];
+  try {
+    entries = await readdir(absoluteDirectory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") && relativeDirectory !== ".openclaw") {
+      continue;
+    }
+
+    const childRelativePath = toPosixPath(path.join(relativeDirectory, entry.name));
+
+    if (isBlockedWorkspacePath(childRelativePath) || entry.isSymbolicLink()) {
+      continue;
+    }
+
+    if (entry.isDirectory()) {
+      await collectFiles(workspacePath, childRelativePath, output, options, currentDepth + 1);
+      continue;
+    }
+
+    if (entry.isFile() && options.include(childRelativePath)) {
+      output.add(childRelativePath);
+    }
+  }
+}
+
+async function buildFileEntry(
+  workspacePath: string,
+  workspaceRealPath: string,
+  relativePath: string,
+  descriptor: WorkspaceFileDescriptor
+): Promise<WorkspaceManagedFile> {
+  const absolutePath = resolveWorkspaceChildPath(workspacePath, relativePath);
+  const label = path.posix.basename(relativePath);
+
+  try {
+    const fileStat = await lstat(absolutePath);
+    if (fileStat.isSymbolicLink()) {
+      return {
+        path: relativePath,
+        label,
+        category: descriptor.category,
+        language: descriptor.language,
+        exists: true,
+        createable: false,
+        editable: false,
+        size: null,
+        source: descriptor.source,
+        description: descriptor.description,
+        usage: descriptor.usage,
+        runtimeBehavior: descriptor.runtimeBehavior,
+        reason: "Symlinks are not editable here."
+      };
+    }
+
+    if (!fileStat.isFile()) {
+      return {
+        path: relativePath,
+        label,
+        category: descriptor.category,
+        language: descriptor.language,
+        exists: true,
+        createable: false,
+        editable: false,
+        size: null,
+        source: descriptor.source,
+        description: descriptor.description,
+        usage: descriptor.usage,
+        runtimeBehavior: descriptor.runtimeBehavior,
+        reason: "Only regular Markdown and JSON files are editable."
+      };
+    }
+
+    await assertRealPathInsideWorkspace(absolutePath, workspaceRealPath);
+
+    return {
+      path: relativePath,
+      label,
+      category: descriptor.category,
+      language: descriptor.language,
+      exists: true,
+      createable: false,
+      editable: fileStat.size <= WORKSPACE_MANAGED_FILE_MAX_BYTES,
+      size: fileStat.size,
+      source: descriptor.source,
+      description: descriptor.description,
+      usage: descriptor.usage,
+      runtimeBehavior: descriptor.runtimeBehavior,
+      reason: fileStat.size > WORKSPACE_MANAGED_FILE_MAX_BYTES
+        ? `File is larger than ${formatBytes(WORKSPACE_MANAGED_FILE_MAX_BYTES)}.`
+        : undefined
+    };
+  } catch {
+    return {
+      path: relativePath,
+      label,
+      category: descriptor.category,
+      language: descriptor.language,
+      exists: false,
+      createable: descriptor.createable,
+      editable: descriptor.createable,
+      size: null,
+      source: descriptor.source,
+      description: descriptor.description,
+      usage: descriptor.usage,
+      runtimeBehavior: descriptor.runtimeBehavior
+    };
+  }
+}
+
+function describeAllowedWorkspaceFile(
+  relativePath: string,
+  source: WorkspaceManagedFileSource
+): WorkspaceFileDescriptor | null {
+  const official = officialSpecByPath.get(relativePath);
+  if (official) {
+    return {
+      category: official.category,
+      language: official.language,
+      source: "official",
+      description: official.description,
+      usage: official.usage,
+      runtimeBehavior: official.runtimeBehavior,
+      createable: official.createable !== false
+    };
+  }
+
+  const legacy = legacyWorkspaceFileSpecs.get(relativePath);
+  if (legacy) {
+    return {
+      category: legacy.category,
+      language: legacy.language,
+      source: "discovered",
+      description: legacy.description,
+      usage: legacy.usage,
+      runtimeBehavior: legacy.runtimeBehavior,
+      createable: false
+    };
+  }
+
+  if (isBlockedWorkspacePath(relativePath)) {
+    return null;
+  }
+
+  const parts = relativePath.split("/");
+  const language = inferLanguage(relativePath);
+
+  if (!language) {
+    return null;
+  }
+
+  if (parts[0] === "memory" && parts.length >= 2 && language === "markdown") {
+    return {
+      category: "memory",
+      language,
+      source,
+      description: "Workspace memory note.",
+      usage: "Use memory/*.md files for focused durable notes such as decisions, constraints, research findings, or operating history.",
+      runtimeBehavior: "Agents can read these files from the workspace when they need supporting memory beyond root MEMORY.md.",
+      createable: true
+    };
+  }
+
+  if (parts[0] === "docs" && parts.length >= 2) {
+    return {
+      category: "context",
+      language,
+      source,
+      description: "Project documentation file.",
+      usage: "Use docs/*.md or docs/*.json for project briefs, architecture notes, specs, plans, and other shared reference material.",
+      runtimeBehavior: "Agents can read these workspace docs when tasks require project detail beyond bootstrap files.",
+      createable: true
+    };
+  }
+
+  if (parts[0] === "skills" && parts.at(-1) === "SKILL.md") {
+    return {
+      category: parts[1]?.startsWith("agent-policy-") ? "agent-policy-config" : "skills",
+      language: "markdown",
+      source,
+      description: parts[1]?.startsWith("agent-policy-")
+        ? "Agent policy skill instructions."
+        : "Workspace skill instructions.",
+      usage: parts[1]?.startsWith("agent-policy-")
+        ? "Use this for AgentOS-generated per-agent policy rules. Prefer editing AGENTS.md for persona and role changes."
+        : "Use this to define reusable instructions for a specific capability or workflow.",
+      runtimeBehavior: "OpenClaw can load workspace skills when they are assigned to or selected by an agent.",
+      createable: true
+    };
+  }
+
+  if (parts[0] === ".agents" && parts[1] === "skills" && parts.at(-1) === "SKILL.md") {
+    return {
+      category: "skills",
+      language: "markdown",
+      source,
+      description: "Legacy workspace skill instructions.",
+      usage: "Use root skills/*/SKILL.md for new workspace skills when possible.",
+      runtimeBehavior: "Listed for compatibility with older workspace skill layouts.",
+      createable: true
+    };
+  }
+
+  const openClawDescriptor = describeAllowedOpenClawRelativePath(relativePath);
+  if (openClawDescriptor) {
+    return {
+      ...openClawDescriptor,
+      source,
+      createable: openClawDescriptor.createable
+    };
+  }
+
+  return null;
+}
+
+function describeAllowedOpenClawRelativePath(relativePath: string): Omit<WorkspaceFileDescriptor, "source"> | null {
+  if (!relativePath.startsWith(".openclaw/")) {
+    return null;
+  }
+
+  if (isBlockedWorkspacePath(relativePath)) {
+    return null;
+  }
+
+  const parts = relativePath.split("/");
+  const language = inferLanguage(relativePath);
+  if (!language) {
+    return null;
+  }
+
+  if (parts.length === 2) {
+    if (!safeOpenClawRootFileNames.has(parts[1])) {
+      return null;
+    }
+
+    return {
+      category: "project-config",
+      language,
+      description: "Safe workspace metadata file under .openclaw.",
+      usage: "Use only for project/workspace metadata that does not contain credentials, sessions, provider auth, or tokens.",
+      runtimeBehavior: "AgentOS only exposes allowlisted .openclaw metadata files from the current workspace.",
+      createable: parts[1] === "project.json"
+    };
+  }
+
+  return null;
+}
+
+function normalizeWorkspaceRelativePath(inputPath: string) {
+  const raw = inputPath.trim().replace(/\\/g, "/");
+
+  if (!raw || raw.startsWith("/") || raw.includes("\0")) {
+    throw new Error("Workspace file path is invalid.");
+  }
+
+  const normalized = path.posix.normalize(raw);
+
+  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) {
+    throw new Error("Workspace file path is outside the workspace.");
+  }
+
+  return normalized;
+}
+
+function resolveWorkspaceChildPath(workspacePath: string, relativePath: string) {
+  const absolutePath = path.resolve(workspacePath, relativePath);
+  const absoluteWorkspacePath = path.resolve(workspacePath);
+  const workspacePrefix = `${absoluteWorkspacePath}${path.sep}`;
+
+  if (absolutePath !== absoluteWorkspacePath && !absolutePath.startsWith(workspacePrefix)) {
+    throw new Error("Workspace file path is outside the workspace.");
+  }
+
+  return absolutePath;
+}
+
+async function assertExistingFileSafe(absolutePath: string, workspaceRealPath: string) {
+  const fileStat = await lstat(absolutePath);
+  if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+    throw new Error("Only regular workspace files can be edited.");
+  }
+
+  await assertRealPathInsideWorkspace(absolutePath, workspaceRealPath);
+}
+
+async function ensureWorkspaceDirectory(absolutePath: string, workspacePath: string, workspaceRealPath: string) {
+  const absoluteWorkspacePath = path.resolve(workspacePath);
+  const workspacePrefix = `${absoluteWorkspacePath}${path.sep}`;
+
+  if (absolutePath !== absoluteWorkspacePath && !absolutePath.startsWith(workspacePrefix)) {
+    throw new Error("Workspace file path is outside the workspace.");
+  }
+
+  const relativePath = path.relative(absoluteWorkspacePath, absolutePath);
+  const segments = relativePath ? relativePath.split(path.sep).filter(Boolean) : [];
+  let currentPath = absoluteWorkspacePath;
+
+  for (const segment of segments) {
+    currentPath = path.join(currentPath, segment);
+
+    try {
+      const stat = await lstat(currentPath);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error("Workspace file parent path is not a regular directory.");
+      }
+
+      await assertRealPathInsideWorkspace(currentPath, workspaceRealPath);
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+
+      await mkdir(currentPath);
+      await assertRealPathInsideWorkspace(currentPath, workspaceRealPath);
+    }
+  }
+}
+
+async function assertRealPathInsideWorkspace(absolutePath: string, workspaceRealPath: string) {
+  const targetRealPath = await realpath(absolutePath);
+  const workspacePrefix = `${workspaceRealPath}${path.sep}`;
+
+  if (targetRealPath !== workspaceRealPath && !targetRealPath.startsWith(workspacePrefix)) {
+    throw new Error("Workspace file path resolves outside the workspace.");
+  }
+}
+
+function isBlockedWorkspacePath(relativePath: string) {
+  return relativePath
+    .split("/")
+    .some((part) => blockedPathTokenPattern.test(part));
+}
+
+function inferLanguage(relativePath: string): WorkspaceManagedFileLanguage | null {
+  if (relativePath.endsWith(".md")) {
+    return "markdown";
+  }
+
+  if (relativePath.endsWith(".json")) {
+    return "json";
+  }
+
+  return null;
+}
+
+function compareWorkspaceManagedFiles(left: WorkspaceManagedFile, right: WorkspaceManagedFile) {
+  const leftCategoryIndex = workspaceFileCategoryOrder.indexOf(left.category);
+  const rightCategoryIndex = workspaceFileCategoryOrder.indexOf(right.category);
+
+  if (leftCategoryIndex !== rightCategoryIndex) {
+    return leftCategoryIndex - rightCategoryIndex;
+  }
+
+  if (left.source !== right.source) {
+    return workspaceFileSourceOrder.indexOf(left.source) - workspaceFileSourceOrder.indexOf(right.source);
+  }
+
+  return left.path.localeCompare(right.path);
+}
+
+function toPosixPath(value: string) {
+  return value.split(path.sep).join("/");
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
+const workspaceFileCategoryOrder: WorkspaceManagedFileCategory[] = [
+  "context",
+  "memory",
+  "identity",
+  "tools",
+  "boot",
+  "skills",
+  "project-config",
+  "agent-policy-config"
+];
+
+const workspaceFileSourceOrder: WorkspaceManagedFileSource[] = ["official", "virtual", "discovered"];

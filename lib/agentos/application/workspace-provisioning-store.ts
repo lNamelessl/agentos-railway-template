@@ -1,0 +1,381 @@
+import "server-only";
+
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
+import path from "node:path";
+
+import type { WorkspaceBlueprint } from "@/lib/agentos/domains/workspace-blueprint";
+import type { WorkspaceCompositionPlan } from "@/lib/agentos/domains/workspace-composition";
+import type { WorkspaceNativeKnowledgeStatus } from "@/lib/agentos/application/workspace-native-knowledge-service";
+import type { WorkspaceCreateResult } from "@/lib/openclaw/types";
+import { missionControlRootPath } from "@/lib/openclaw/state/paths";
+
+export const WORKSPACE_PROVISIONING_SCHEMA_VERSION = 2 as const;
+export const WORKSPACE_PROVISIONING_ROOT = path.join(missionControlRootPath, "workspace-provisioning-runs");
+export const WORKSPACE_PROVISIONING_MANIFEST_RELATIVE_PATH = ".openclaw/agentos-provisioning.json";
+
+export const workspaceProvisioningStates = [
+  "pending",
+  "validating",
+  "materializing",
+  "bootstrapping",
+  "preparing-environment",
+  "applying-composition",
+  "promoting-knowledge",
+  "provisioning-agents",
+  "binding-knowledge",
+  "applying-capabilities",
+  "recording-declarations",
+  "verifying",
+  "ready",
+  "partial",
+  "failed",
+  "cancelled"
+] as const;
+
+export type WorkspaceProvisioningState = (typeof workspaceProvisioningStates)[number];
+
+export const provisioningCompletedStepIds = [
+  "validated",
+  "workspace-materialized",
+  "bootstrap-verified",
+  "environment-prepared",
+  "composition-applied",
+  "knowledge-promoted",
+  "agents-verified",
+  "knowledge-bound",
+  "capabilities-applied",
+  "declarations-recorded",
+  "final-verification-complete"
+] as const;
+
+export type ProvisioningCompletedStepId = (typeof provisioningCompletedStepIds)[number];
+
+export const workspaceEnvironmentPreparationStates = [
+  "not-requested",
+  "pending",
+  "in-progress",
+  "prepared",
+  "reused",
+  "unsupported",
+  "blocked",
+  "partial",
+  "failed",
+  "unknown"
+] as const;
+
+export type WorkspaceEnvironmentPreparationState = (typeof workspaceEnvironmentPreparationStates)[number];
+export type WorkspaceEnvironmentPreparationIntent = { requested: true; profileId: string };
+export type WorkspaceEnvironmentPreparationLocation = "local" | "remote" | "unknown";
+export type WorkspaceEnvironmentPreparationCostStatus = "not-requested" | "not-applicable" | "unknown" | "approval-required";
+
+export type WorkspaceEnvironmentPreparationProjection = {
+  requested: boolean;
+  profileId: string | null;
+  projectPath: string | null;
+  status: WorkspaceEnvironmentPreparationState;
+  location: WorkspaceEnvironmentPreparationLocation;
+  environmentId: string | null;
+  preparationKey: string | null;
+  reused: boolean | null;
+  cost: {
+    status: WorkspaceEnvironmentPreparationCostStatus;
+    detail: string;
+  };
+  retryable: boolean;
+  recovery: string | null;
+  error: { code: string; message: string } | null;
+  updatedAt: string | null;
+};
+
+export function createWorkspaceEnvironmentPreparationProjection(
+  intent?: WorkspaceEnvironmentPreparationIntent | null,
+  now = new Date().toISOString()
+): WorkspaceEnvironmentPreparationProjection {
+  if (!intent) {
+    return {
+      requested: false,
+      profileId: null,
+      projectPath: null,
+      status: "not-requested",
+      location: "unknown",
+      environmentId: null,
+      preparationKey: null,
+      reused: null,
+      cost: { status: "not-requested", detail: "No native environment preparation was requested." },
+      retryable: false,
+      recovery: null,
+      error: null,
+      updatedAt: now
+    };
+  }
+  return {
+    requested: true,
+    profileId: intent.profileId,
+    projectPath: null,
+    status: "pending",
+    location: "unknown",
+    environmentId: null,
+    preparationKey: null,
+    reused: null,
+    cost: {
+      status: "unknown",
+      detail: "OpenClaw determines placement and provider economics; AgentOS does not allocate capacity directly."
+    },
+    retryable: false,
+    recovery: "OpenClaw owns environment lifecycle and cleanup. AgentOS will retain the native identity returned by preparation.",
+    error: null,
+    updatedAt: now
+  };
+}
+
+export type ProvisioningCheckpoint = {
+  completedAt: string;
+  evidence: Record<string, string>;
+};
+
+export type StoredWorkspaceProvisioningRun = {
+  schemaVersion: typeof WORKSPACE_PROVISIONING_SCHEMA_VERSION;
+  runId: string;
+  actorHash: string;
+  idempotencyKeyHash: string;
+  creationRunId?: string | null;
+  blueprintId: string;
+  blueprintFingerprint: string;
+  /** Exact validated input snapshot required for process-restart recovery. */
+  blueprint: unknown;
+  compositionPlan?: WorkspaceCompositionPlan | null;
+  draftContextId: string | null;
+  expectedKnowledgeGenerationId: string | null;
+  state: WorkspaceProvisioningState;
+  createdAt: string;
+  updatedAt: string;
+  attempt: number;
+  workspaceId: string | null;
+  workspacePath: string | null;
+  /** Binding predecessor captured before this run mutates the workspace. */
+  expectedCurrentProvisioningRunId?: string | null;
+  /** AgentOS projection of one explicit native OpenClaw preparation request. */
+  environmentPreparation: WorkspaceEnvironmentPreparationProjection;
+  result: WorkspaceCreateResult | null;
+  completedSteps: Partial<Record<ProvisioningCompletedStepId, ProvisioningCheckpoint>>;
+  warnings: string[];
+  error: { code: string; message: string } | null;
+  progress: { label: string; detail: string } | null;
+  knowledge: {
+    stagedGenerationId: string | null;
+    promotedGenerationId: string | null;
+    sourceIds: string[];
+    documentCount: number;
+  } | null;
+  nativeKnowledge: {
+    status: WorkspaceNativeKnowledgeStatus["status"];
+    indexActionRequired: WorkspaceNativeKnowledgeStatus["indexActionRequired"];
+    restartRequired: boolean | null;
+  } | null;
+  composition: {
+    planId: string;
+    status: "ready" | "partial" | "fallback" | "blocked";
+    artifactCount: number;
+    appliedCount: number;
+    conflictCount: number;
+    warnings: string[];
+  } | null;
+  pendingSetup: {
+    channels: string[];
+    connections: string[];
+    automations: string[];
+  };
+  verifiedAt: string | null;
+};
+
+export type StoredRunLocator = {
+  run: StoredWorkspaceProvisioningRun;
+  filePath: string;
+};
+
+export type CreateProvisioningRunResult = {
+  run: StoredWorkspaceProvisioningRun;
+  created: boolean;
+};
+
+const RUN_ID_PATTERN = /^[a-f0-9-]{36}$/i;
+
+export function resolveProvisioningRoot(rootPath = WORKSPACE_PROVISIONING_ROOT) {
+  return path.resolve(rootPath);
+}
+
+export function actorHash(actorId: string) {
+  return sha256(actorId.trim()).slice(0, 32);
+}
+
+export function buildProvisioningStorageKey(actorId: string, idempotencyKey: string) {
+  return `${actorHash(actorId)}:${sha256(idempotencyKey.trim())}`;
+}
+
+export function runPath(rootPath: string, storageKey: string) {
+  return path.join(resolveProvisioningRoot(rootPath), `${sha256(storageKey)}.json`);
+}
+
+export function runPathFromStoredRun(rootPath: string, run: StoredWorkspaceProvisioningRun) {
+  return path.join(resolveProvisioningRoot(rootPath), `${run.idempotencyKeyHash}.json`);
+}
+
+export async function createRunAtomically(rootPath: string, storageKey: string, input: {
+  actorId: string;
+  blueprint: WorkspaceBlueprint;
+  blueprintFingerprint: string;
+  draftContextId: string | null;
+  expectedKnowledgeGenerationId: string | null;
+  compositionPlan?: WorkspaceCompositionPlan | null;
+  creationRunId?: string | null;
+  environmentPreparation?: WorkspaceEnvironmentPreparationIntent | null;
+}): Promise<CreateProvisioningRunResult> {
+  const root = resolveProvisioningRoot(rootPath);
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const now = new Date().toISOString();
+  const run: StoredWorkspaceProvisioningRun = {
+    schemaVersion: WORKSPACE_PROVISIONING_SCHEMA_VERSION,
+    runId: randomUUID(),
+    actorHash: actorHash(input.actorId),
+    idempotencyKeyHash: sha256(storageKey),
+    creationRunId: input.creationRunId ?? null,
+    blueprintId: input.blueprint.id,
+    blueprintFingerprint: input.blueprintFingerprint,
+    blueprint: input.blueprint,
+    draftContextId: input.draftContextId,
+    expectedKnowledgeGenerationId: input.expectedKnowledgeGenerationId,
+    compositionPlan: input.compositionPlan ?? null,
+    environmentPreparation: createWorkspaceEnvironmentPreparationProjection(input.environmentPreparation),
+    state: "pending",
+    createdAt: now,
+    updatedAt: now,
+    attempt: 1,
+    workspaceId: null,
+    workspacePath: null,
+    // Captured after OpenClaw returns the canonical workspace identity.
+    result: null,
+    completedSteps: {},
+    warnings: [],
+    error: null,
+    progress: { label: "Preparing workspace", detail: "Provisioning is queued." },
+    knowledge: null,
+    nativeKnowledge: null,
+    composition: null,
+    pendingSetup: { channels: [], connections: [], automations: [] },
+    verifiedAt: null
+  };
+  const filePath = runPath(root, storageKey);
+  try {
+    const handle = await open(filePath, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(run, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return { run, created: true };
+  } catch (error) {
+    if (isFileExistsError(error)) {
+      const existing = await readStoredRun(root, storageKey);
+      if (!existing) throw new Error("Workspace provisioning run is unavailable or malformed.");
+      return { run: existing, created: false };
+    }
+    throw error;
+  }
+}
+
+export async function readStoredRun(rootPath: string, storageKey: string) {
+  return readStoredRunFile(runPath(rootPath, storageKey));
+}
+
+export async function readStoredRunFile(filePath: string): Promise<StoredWorkspaceProvisioningRun | null> {
+  const raw = await readFile(filePath, "utf8").catch(() => null);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as StoredWorkspaceProvisioningRun;
+    if (parsed.schemaVersion !== WORKSPACE_PROVISIONING_SCHEMA_VERSION || !RUN_ID_PATTERN.test(parsed.runId)) return null;
+    return {
+      ...parsed,
+      compositionPlan: parsed.compositionPlan ?? null,
+      composition: parsed.composition ?? null,
+      environmentPreparation: parsed.environmentPreparation ?? createWorkspaceEnvironmentPreparationProjection()
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function findRunById(rootPath: string, actorId: string, runId: string): Promise<StoredRunLocator | null> {
+  const expectedActorHash = actorHash(actorId);
+  const files = await readdir(resolveProvisioningRoot(rootPath)).catch(() => []);
+  for (const fileName of files) {
+    if (!fileName.endsWith(".json")) continue;
+    const filePath = path.join(resolveProvisioningRoot(rootPath), fileName);
+    const run = await readStoredRunFile(filePath);
+    if (run?.actorHash === expectedActorHash && run.runId === runId) return { run, filePath };
+  }
+  return null;
+}
+
+export async function updateStoredRun(
+  filePath: string,
+  run: StoredWorkspaceProvisioningRun,
+  updates: Partial<StoredWorkspaceProvisioningRun>
+) {
+  assertImmutableRunFields(run, updates);
+  const next = { ...run, ...updates };
+  await writeAtomicJson(filePath, next);
+  return next;
+}
+
+export async function writeAtomicJson(filePath: string, value: unknown) {
+  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    const handle = await open(temporaryPath, "w", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporaryPath, filePath);
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
+function sha256(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function isFileExistsError(error: unknown) {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
+}
+
+function assertImmutableRunFields(run: StoredWorkspaceProvisioningRun, updates: Partial<StoredWorkspaceProvisioningRun>) {
+  if (
+    ("runId" in updates && updates.runId !== run.runId)
+    || ("actorHash" in updates && updates.actorHash !== run.actorHash)
+    || ("idempotencyKeyHash" in updates && updates.idempotencyKeyHash !== run.idempotencyKeyHash)
+    || ("blueprintId" in updates && updates.blueprintId !== run.blueprintId)
+    || ("blueprintFingerprint" in updates && updates.blueprintFingerprint !== run.blueprintFingerprint)
+    || ("draftContextId" in updates && updates.draftContextId !== run.draftContextId)
+    || ("expectedKnowledgeGenerationId" in updates && updates.expectedKnowledgeGenerationId !== run.expectedKnowledgeGenerationId)
+    || ("creationRunId" in updates && updates.creationRunId !== run.creationRunId)
+    || ("expectedCurrentProvisioningRunId" in updates && "expectedCurrentProvisioningRunId" in run && updates.expectedCurrentProvisioningRunId !== run.expectedCurrentProvisioningRunId)
+    || ("blueprint" in updates && stableStringify(updates.blueprint) !== stableStringify(run.blueprint))
+    || ("compositionPlan" in updates && stableStringify(updates.compositionPlan) !== stableStringify(run.compositionPlan))
+  ) {
+    throw new Error("Provisioning intent is immutable after run creation.");
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
