@@ -71,7 +71,7 @@ jobs:
 
             - Upstream: SapienXai/AgentOS@${{ steps.upstream.outputs.sha }}
             - Previous pin: ${{ steps.upstream.outputs.pinned }}
-            - Smoke test: `docker build -f Dockerfile.railway .` passed on this commit.
+            - Smoke test: `docker build -f Dockerfile .` passed on this commit.
 
             Review upstream release notes before merging, and redeploy the Railway
             template service after merging to pick up the new revision.
